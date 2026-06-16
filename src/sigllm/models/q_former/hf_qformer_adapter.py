@@ -82,7 +82,14 @@ class HFQFormerAdapter(nn.Module):
         )
 
         self.q = Parameter(torch.randn(1, num_queries, d_model))
-        self.proj_cf = nn.Linear(d_cf, d_model)
+        # CHANGE B: separate projectors for users vs items. User-factor and
+        # item-factor geometry differ in MF space, so a single shared `proj_cf`
+        # forces them into one map. `proj_user` handles the user slot;
+        # `proj_item` handles the target + history slots (both are items).
+        # Legacy `proj_cf` checkpoints are warm-loaded into BOTH (see
+        # `load_state_dict`).
+        self.proj_user = nn.Linear(d_cf, d_model)
+        self.proj_item = nn.Linear(d_cf, d_model)
         self.type_emb = Parameter(torch.randn(3, d_model) * initializer_range)
         self.pos_emb = Parameter(torch.randn(self.max_history_length, d_model) * initializer_range)
         self.out_proj = nn.Identity() if self.output_dim == d_model else nn.Linear(d_model, self.output_dim)
@@ -176,6 +183,22 @@ class HFQFormerAdapter(nn.Module):
         remapped_state_dict = dict(state_dict)
         expected_keys = set(super().state_dict().keys())
 
+        # CHANGE B: legacy checkpoints have a single `proj_cf.{weight,bias}`.
+        # Warm-init BOTH new projectors from it so old Stage-1/2 checkpoints
+        # still load. Only fill targets the checkpoint doesn't already provide.
+        legacy_proj = {
+            k: v for k, v in remapped_state_dict.items()
+            if k == "proj_cf.weight" or k == "proj_cf.bias"
+        }
+        if legacy_proj:
+            for legacy_key, value in legacy_proj.items():
+                suffix = legacy_key.split(".", 1)[1]  # "weight" | "bias"
+                for new_prefix in ("proj_user", "proj_item"):
+                    new_key = f"{new_prefix}.{suffix}"
+                    if new_key in expected_keys and new_key not in remapped_state_dict:
+                        remapped_state_dict[new_key] = value.clone()
+                remapped_state_dict.pop(legacy_key, None)
+
         has_prefixed_qformer_keys = any(
             isinstance(k, str) and k.startswith("qformer.") for k in remapped_state_dict
         )
@@ -257,10 +280,10 @@ class HFQFormerAdapter(nn.Module):
         batch_size = user_cf.size(0)
         device = user_cf.device
 
-        user_tok = self.proj_cf(user_cf) + self.type_emb[TYPE_USER]
-        target_tok = self.proj_cf(target_cf) + self.type_emb[TYPE_TARGET]
+        user_tok = self.proj_user(user_cf) + self.type_emb[TYPE_USER]
+        target_tok = self.proj_item(target_cf) + self.type_emb[TYPE_TARGET]
         history_tok = (
-            self.proj_cf(history_cf)
+            self.proj_item(history_cf)
             + self.type_emb[TYPE_HISTORY]
             + self.pos_emb.unsqueeze(0)
         )
