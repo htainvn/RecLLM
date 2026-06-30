@@ -63,8 +63,13 @@ model:
   #   - "both"        : soft tokens AND weight delta.
   # `cora_alpha` scales the delta (scaling = cora_alpha / num_queries, LoRA-style).
   # `cora_target_modules` defaults to the same projections LoRA adapts.
+  # `cora_alpha` sets the ceiling scale (scaling = cora_alpha / num_queries).
+  # The injector also normalizes queries to unit L2 and uses a zero-init tanh
+  # gate per shape, so the delta starts at exactly 0 and grows only as far as
+  # training wants — this is what keeps `both`/`lora_weight` stable. Kept low
+  # on purpose; raise cautiously and watch val AUC for divergence.
   cf_injection_mode: "soft_token"
-  cora_alpha: 16
+  cora_alpha: 4
   cora_target_modules: ${model.lora_config.target_modules}
 
   rec_model: "MF"
