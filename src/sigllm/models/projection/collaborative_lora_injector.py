@@ -65,16 +65,6 @@ class CollaborativeLoRAInjector(nn.Module):
         # weight shape among the targets. Keyed by "in_out" string because
         # nn.ModuleDict keys must be strings.
         self.generators = nn.ModuleDict()
-        # Flamingo-style tanh gate per shape, zero-initialized: the CoRA delta
-        # starts at EXACTLY zero and the model learns how much to let in, bounded
-        # by tanh. This is what makes grafting a new pathway onto the frozen LLM
-        # stable (the un-gated version with raw L2~20 queries x scaling 1.0 across
-        # 28 layers diverged and collapsed Step-2 AUC to 0.5).
-        self.gates = nn.ParameterDict()
-        # Normalize each query to unit L2 before the generator so the delta
-        # magnitude is decoupled from the (large, uncontrolled) query norm.
-        self.normalize_queries = True
-
         self._shape_for_module: Dict[int, str] = {}  # id(module) -> shape key
 
         self._queries: Optional[torch.Tensor] = None  # [B, Q, d_model]
@@ -94,14 +84,11 @@ class CollaborativeLoRAInjector(nn.Module):
             "down": nn.Linear(self.d_model, int(in_features), bias=False),
             "up": nn.Linear(self.d_model, int(out_features), bias=False),
         })
-        # Small non-zero init on BOTH factors. The zero-init tanh GATE alone
-        # provides the "delta starts at exactly 0" stability; the up-projection
-        # must be non-zero or the gate gets zero gradient and the pathway can
-        # never bootstrap (gate.grad ∝ up-projection, up-projection.grad ∝ gate
-        # — double-zero is a dead pathway). This is the Flamingo recipe: gate
-        # zero-init, underlying transform normally initialized.
+        # Kaiming-ish small init on down, zero on up so the initial delta is
+        # exactly zero (LoRA convention) — training starts from the unmodified
+        # LLM and learns the collaborative correction.
         nn.init.normal_(gen["down"].weight, std=0.02)
-        nn.init.normal_(gen["up"].weight, std=0.02)
+        nn.init.zeros_(gen["up"].weight)
         return gen
 
     def _iter_target_modules(self, llm_model: nn.Module):
@@ -127,7 +114,6 @@ class CollaborativeLoRAInjector(nn.Module):
             key = self._shape_key(in_f, out_f)
             if key not in self.generators:
                 self.generators[key] = self._make_generator(in_f, out_f)
-                self.gates[key] = nn.Parameter(torch.zeros(1))  # tanh(0)=0 -> delta starts at 0
             self._shape_for_module[id(module)] = key
             self._hooks.append(module.register_forward_hook(self._make_hook(key)))
             count += 1
@@ -213,10 +199,6 @@ class CollaborativeLoRAInjector(nn.Module):
             # activation's device (Q-Former and LLM may live on different
             # devices under device_map="auto"), then cast back.
             z = Z.to(device=x.device, dtype=torch.float32)
-            if self.normalize_queries:
-                # Unit-L2 per query: decouples the delta scale from the (large,
-                # ~20) query norm that caused the divergence.
-                z = z / (z.norm(dim=-1, keepdim=True) + 1e-6)
             down_w = gen["down"].weight.to(device=x.device, dtype=torch.float32)
             up_w = gen["up"].weight.to(device=x.device, dtype=torch.float32)
             a = F.linear(z, down_w)   # [B, Q, in]
@@ -225,9 +207,7 @@ class CollaborativeLoRAInjector(nn.Module):
             x32 = x.to(torch.float32)
             # (x @ A^T) @ B : [B,T,in]@[B,in,Q] -> [B,T,Q]; @[B,Q,out] -> [B,T,out]
             delta = torch.matmul(torch.matmul(x32, a.transpose(1, 2)), b)
-            # Zero-init tanh gate: starts at 0, smoothly bounded in (-1, 1).
-            gate = torch.tanh(self.gates[shape_key].to(torch.float32))
-            delta = self.scaling * gate * delta
+            delta = self.scaling * delta
             return output + delta.to(output.dtype)
 
         return hook
