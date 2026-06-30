@@ -81,11 +81,11 @@ run:
     need_train: True
     warm_or_cold: "warm"
     seed: 2025
-    lr: 1e-3
-    wd: 1e-4
+    lr: 1e-2     # raised 10x: ~34k item rows each see only ~21 updates/epoch, so 1e-3 converged glacially
+    wd: 1e-5     # lighter decay so the small embeddings aren't pulled back toward 0
     embedding_size: ${model.rec_config.embedding_size}
     epoch: 5000
-    eval_epoch: 1
+    eval_epoch: 5    # train-AUC is computed over all 727k rows each eval; every-epoch is wasteful
     patience: 100
     batch_size: 1024
   qformer_stage1:

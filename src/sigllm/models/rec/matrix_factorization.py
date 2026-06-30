@@ -12,11 +12,15 @@ class MatrixFactorization(nn.Module):
         self._reset_parameters()
 
     def _reset_parameters(self):
-        # Small-std init so the dot-product logits start near 0 (unsaturated).
-        # Default nn.Embedding init is N(0,1); with embedding_size=256 that makes
-        # logits ~N(0,256) (std~16), saturating BCEWithLogitsLoss -> AUC stuck ~0.5.
-        nn.init.normal_(self.user_embedding.weight, std=0.01)
-        nn.init.normal_(self.item_embedding.weight, std=0.01)
+        # Init scale matters a lot here. Default nn.Embedding init is N(0,1) -> with
+        # embedding_size=256 the dot-product logits are ~N(0,256) (std~16), saturating
+        # BCEWithLogitsLoss -> AUC ~0.5. But std=0.01 is the opposite failure: logits
+        # start ~0.0016, so the model must grow embedding norms ~25x before it can
+        # separate classes, which takes hundreds of epochs at lr=1e-3 (each of the
+        # ~34k item rows is touched only ~21x/epoch). std=0.1 puts the initial logit
+        # std at ~0.16 -- unsaturated AND already at a usable scale.
+        nn.init.normal_(self.user_embedding.weight, std=0.1)
+        nn.init.normal_(self.item_embedding.weight, std=0.1)
         with torch.no_grad():
             self.user_embedding.weight[self.padding_index].zero_()
             self.item_embedding.weight[self.padding_index].zero_()
