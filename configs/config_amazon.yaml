@@ -1,0 +1,199 @@
+model:
+  arch: mini_gpt4rec_v2
+  model_type: pretrain_vicuna
+  llm_model: "/content/SigLLM/ckpt/llm/qwen2-7b-instruct"
+  # Stage 3 step 2 prompt: book-worded, multi-token CF (titles + <CFTokens>).
+  # For the title-free ablation (CHANGE 2a) point this at
+  #   /content/SigLLM/prompts/qformer_prompt_book_mt_notitle.txt
+  prompt_path: "/content/SigLLM/prompts/qformer_prompt_book_mt.txt"
+  prompt_template: "<|im_start|>system\nYou are a helpful book recommendation assistant. Answer only with \"Yes\" or \"No\".<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+
+  freeze_rec: True
+  freeze_proj: False
+
+  # Set True (or load a trained ckpt and flip) to zero the soft tokens and
+  # measure the Q-Former's marginal value vs the plain-text prompt.
+  ablate_soft_tokens: False
+
+  tuning_step: null
+
+  lora_config:
+    use_lora: True
+    r: 8
+    alpha: 16
+    target_modules: [q_proj, v_proj]
+    dropout: 0.05
+
+  max_txt_len: 1024
+  end_sym: "###"
+  ans_type: "v2"
+
+  proj_token_num: ${model.qformer_config.num_queries}
+
+  # CHANGE 2j: collaborative injection mode. "soft_token" (default), "lora_weight",
+  # or "both" (soft tokens AND a per-sample CoRA weight delta). Use "both" as an
+  # experiment arm; keep a TEXT-ONLY / title-free prompt for "lora_weight".
+  cf_injection_mode: "soft_token"
+  cora_alpha: 4
+  cora_target_modules: ${model.lora_config.target_modules}
+
+  rec_model: "MF"
+  user_num: -100
+  item_num: -100
+
+  qformer_config:
+    use_qformer: True
+    qformer_ckpt: "${run.qformer_stage2.output_dir}${run.qformer_stage2.qformer_ckpt_out}"
+    llm_proj_ckpt: "${run.qformer_stage2.output_dir}${run.qformer_stage2.proj_ckpt_out}"
+    qformer_d_model: 768
+    qformer_output_dim: 768
+    qformer_text_model_name: "bert-base-uncased"
+    max_instruction_length: 48
+    num_queries: 16
+    num_heads: 8
+    num_layers: 4
+    max_history_length: 10
+
+  rec_config:
+    # NOTE: set these from the build_amazon_book output ("Set in config" log line)
+    # before training. Placeholders below WILL be wrong for your split.
+    user_num: 1
+    item_num: 1
+    embedding_size: 256
+    pretrained_path: "/content/SigLLM/ckpt/mf/mf_amazon_model.pth"
+
+  ckpt: null
+
+datasets:
+  amazon_book:
+    path: "/content/SigLLM/data/processed/amazon-book/"
+    data_type: default
+    build_info:
+      storage: "/content/SigLLM/data/processed/amazon-book/"
+
+run:
+  task: rec_pretrain
+  output_dir: "ckpt/qformer_stage3_default_amazon"
+  device: "cuda"
+  seed: 42
+  rec_baseline:
+    save_file: ${model.rec_config.pretrained_path}
+    need_train: True
+    warm_or_cold: "warm"
+    seed: 2025
+    lr: 1e-3
+    wd: 1e-4
+    embedding_size: ${model.rec_config.embedding_size}
+    epoch: 5000
+    eval_epoch: 1
+    patience: 100
+    batch_size: 1024
+  qformer_stage1:
+    seed: 2025
+    batch_size: 256
+    num_workers: 4
+    embedding_size: ${model.rec_config.embedding_size}
+    user_num: ${model.rec_config.user_num}
+    item_num: ${model.rec_config.item_num}
+    num_queries: ${model.qformer_config.num_queries}
+    num_heads: ${model.qformer_config.num_heads}
+    num_layers: ${model.qformer_config.num_layers}
+    qformer_d_model: ${model.qformer_config.qformer_d_model}
+    qformer_output_dim: ${model.qformer_config.qformer_output_dim}
+    qformer_text_model_name: ${model.qformer_config.qformer_text_model_name}
+    max_instruction_length: ${model.qformer_config.max_instruction_length}
+    item_pair_window: 2
+    max_item_item_pairs: null
+    max_user_item_pairs: 20000
+    include_user_item: True
+    # CHANGE 2d: domain-aware richer item text for the ITC/ITM/ITG objectives.
+    rich_item_text: True
+    item_noun: "book"
+    lr: 5e-5
+    w_itc: 1.0
+    w_itm: 1.0
+    w_itg: 1.0
+    w_ii: 1.0
+    w_ui: 0.5
+    tau_itc: 0.07
+    tau_ii: 0.05
+    tau_ui: 0.07
+    weight_decay: 1e-3
+    debug_batch: True
+    debug_batch_max_steps: 10
+    early_stopping_patience: 10
+    early_stopping_min_delta: 1e-4
+    best_checkpoint_name: "qformer_stage1_best_full.pt"
+    best_qformer_weights_name: "qformer_stage1_best_qformer.pth"
+    log_epoch: 1
+    epoch: 100
+    pretrained_rec_path: ${model.rec_config.pretrained_path}
+    freeze_rec: True
+    output_dir: "/content/SigLLM/ckpt/qformer_stage1_amazon/"
+
+  qformer_stage2:
+    seed: 2025
+    batch_size: 32
+    num_workers: 4
+    embedding_size: ${model.rec_config.embedding_size}
+    user_num: ${model.rec_config.user_num}
+    item_num: ${model.rec_config.item_num}
+    num_queries: ${model.qformer_config.num_queries}
+    num_heads: ${model.qformer_config.num_heads}
+    num_layers: ${model.qformer_config.num_layers}
+    qformer_d_model: ${model.qformer_config.qformer_d_model}
+    qformer_output_dim: ${model.qformer_config.qformer_output_dim}
+    qformer_text_model_name: ${model.qformer_config.qformer_text_model_name}
+    max_instruction_length: ${model.qformer_config.max_instruction_length}
+    llm_model_name: ${model.llm_model}
+    pretrained_rec_path: ${model.rec_config.pretrained_path}
+    qformer_ckpt_in: "${run.qformer_stage1.output_dir}${run.qformer_stage1.best_qformer_weights_name}"
+    qformer_ckpt_out: "qformer_stage2_best_qformer.pth"
+    proj_ckpt_out: "qformer_stage2_best_proj.pth"
+    output_dir: "/content/SigLLM/ckpt/qformer_stage2_amazon/"
+    lr: 1e-4
+    weight_decay: 1e-3
+    epoch: 50
+    log_epoch: 1
+    max_caption_length: 64
+    early_stopping_patience: 8
+    early_stopping_min_delta: 1e-4
+
+  qformer_stage3_step1:
+    prompt_path: "/content/SigLLM/prompts/qformer_prompt_book_text_only.txt"
+    output_dir: "/content/SigLLM/ckpt/qformer_stage3_step1_lora_amazon/"
+    best_ckpt_name: "checkpoint_best.pth"
+    init_lr: 2e-4
+    max_epoch: 5
+
+  qformer_stage3_step2:
+    prompt_path: "/content/SigLLM/prompts/qformer_prompt_book_mt.txt"
+    output_dir: "/content/SigLLM/ckpt/qformer_stage3_step2_cie_amazon/"
+    ckpt: "${run.qformer_stage3_step1.output_dir}${run.qformer_stage3_step1.best_ckpt_name}"
+    init_lr: 3e-5
+    max_epoch: 200
+
+  lr_sched: "linear_warmup_cosine_lr"
+  init_lr: 1e-4
+  min_lr: 8e-5
+  warmup_lr: 1e-5
+  weight_decay: 1e-3
+  amp: True
+
+  max_epoch: 200
+  iters_per_epoch: 400
+  batch_size_train: 16
+  batch_size_eval: 64
+  num_workers: 4
+  warmup_steps: 200
+
+  evaluate: False
+  mode: "v2"
+  train_splits: ["train"]
+  valid_splits: ["valid"]
+  test_splits: ["test", "test_warm", "test_cold"]
+  resume_ckpt_path: null
+
+  distributed: True
+  world_size: 1
+  dist_url: "env://"

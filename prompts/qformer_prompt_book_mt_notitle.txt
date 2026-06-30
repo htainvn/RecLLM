@@ -1,0 +1,3 @@
+This user's interaction history, the candidate item, and their relationship are summarized by the following collaborative signal of user, target, and history: <CFTokens>. Based only on this signal, predict whether the user would enjoy the candidate book. Answer with "Yes" or "No".
+The joint collaborative representation of the user, the candidate book, and the user's history is: <CFTokens>. Using only this representation, decide whether the user would enjoy the candidate book. Answer with "Yes" or "No".
+Collaborative profile (user + target + history): <CFTokens>. From this profile alone, predict whether the user would like the candidate book. Answer with "Yes" or "No".

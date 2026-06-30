@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 
 import pandas as pd
 import torch
@@ -95,6 +96,54 @@ class QFormerAlignmentBuilder(RecBaseDatasetBuilder):
 
     train_dataset_cls = QFormerAlignmentDataset
 
+    # CHANGE 2d: richer item text. The single-line "Title: X. Genres: A, B."
+    # gives the ITC/ITM/ITG objectives almost nothing to align beyond a bare
+    # title + a genre bag, so the item-text branch underfits. ``rich_item_text``
+    # adds the release year (parsed out of the "Title (YYYY)" convention used by
+    # ML-1M), spells the genre/category list into a natural sentence, and frames
+    # it as an item description. ``item_noun`` controls the domain word ("movie"
+    # for ML-1M, "book" for Amazon-Book). Set ``rich_item_text=False`` to
+    # reproduce the legacy text.
+    _YEAR_RE = re.compile(r"\((\d{4})\)\s*$")
+
+    @staticmethod
+    def _format_item_text_basic(title: str, genres: list[str]) -> str:
+        """Legacy single-line item metadata text."""
+        if genres:
+            return f"Title: {title}. Genres: {', '.join(genres)}."
+        return f"Title: {title}."
+
+    @classmethod
+    def _format_item_text_rich(cls, title: str, genres: list[str], item_noun: str = "movie") -> str:
+        """Descriptive, year-aware item text for the item-text objectives.
+
+        Example (``item_noun="movie"``): ``"Toy Story (1995)" + [Animation,
+        Children's, Comedy]`` -> ``"Toy Story is a 1995 movie. Its genres are
+        Animation, Children's and Comedy. Represent this movie for
+        recommendation."``
+
+        For Amazon-Book the title usually carries no year and ``genres`` holds
+        the product categories, so it degrades to e.g. ``"<book title> is a
+        book. Its categories are Fiction and Fantasy. Represent this book for
+        recommendation."``
+        """
+        year_match = cls._YEAR_RE.search(title.strip())
+        year = year_match.group(1) if year_match else None
+        clean_title = cls._YEAR_RE.sub("", title).strip() if year else title.strip()
+
+        attr_word = "genres" if item_noun == "movie" else "categories"
+        year_clause = f"a {year} {item_noun}" if year else f"a {item_noun}"
+
+        sentences = [f"{clean_title} is {year_clause}."]
+        if genres:
+            if len(genres) == 1:
+                genre_phrase = genres[0]
+            else:
+                genre_phrase = ", ".join(genres[:-1]) + " and " + genres[-1]
+            sentences.append(f"Its {attr_word} are {genre_phrase}.")
+        sentences.append(f"Represent this {item_noun} for recommendation.")
+        return " ".join(sentences)
+
     @staticmethod
     def build_qformer_alignment_samples(
         input_pkl_path: str,
@@ -104,6 +153,8 @@ class QFormerAlignmentBuilder(RecBaseDatasetBuilder):
         max_item_item_pairs: int | None = None,
         max_user_item_pairs: int | None = None,
         include_user_item: bool = False,
+        rich_item_text: bool = True,
+        item_noun: str = "movie",
     ):
         rng = random.Random(seed)
 
@@ -147,14 +198,19 @@ class QFormerAlignmentBuilder(RecBaseDatasetBuilder):
         item_titles: dict[int, str] = {}
         item_genres: dict[int, list[str]] = {}
         for iid, title, genres in df[["iid", "title", "genres"]].drop_duplicates("iid").itertuples(index=False):
+            # Amazon-Book items can legitimately have no categories; tolerate an
+            # empty genre/category list instead of failing the whole build (the
+            # text formatter simply drops the genre clause in that case).
             parsed_genres = parse_genres(genres)
-            if not parsed_genres:
-                raise ValueError(f"Item {iid} has empty genres.")
             item_titles[int(iid)] = str(title)
             item_genres[int(iid)] = parsed_genres
 
         def format_item_text(iid: int) -> str:
-            return f"Title: {item_titles[int(iid)]}. Genres: {', '.join(item_genres[int(iid)])}."
+            title = item_titles[int(iid)]
+            genres = item_genres[int(iid)]
+            if rich_item_text:
+                return QFormerAlignmentBuilder._format_item_text_rich(title, genres, item_noun=item_noun)
+            return QFormerAlignmentBuilder._format_item_text_basic(title, genres)
 
         samples = []
 

@@ -60,6 +60,11 @@ def build_qformer_pkls(cfg) -> None:
     max_item_item_pairs = stage1_cfg.get("max_item_item_pairs", None)
     max_user_item_pairs = stage1_cfg.get("max_user_item_pairs", None)
     include_user_item = bool(stage1_cfg.get("include_user_item", False))
+    # CHANGE 2d: richer, domain-aware item text. ``item_noun`` is "movie" for
+    # ML-1M and "book" for Amazon-Book; ``rich_item_text`` toggles the
+    # descriptive template vs the legacy single-line string.
+    rich_item_text = bool(stage1_cfg.get("rich_item_text", True))
+    item_noun = str(stage1_cfg.get("item_noun", "movie"))
 
     log_step(
         "Build config",
@@ -67,7 +72,8 @@ def build_qformer_pkls(cfg) -> None:
             f"data_dir={data_dir}, seed={seed}, item_pair_window={item_pair_window}, "
             f"max_item_item_pairs={max_item_item_pairs}, "
             f"max_user_item_pairs={max_user_item_pairs}, "
-            f"include_user_item={include_user_item}"
+            f"include_user_item={include_user_item}, "
+            f"rich_item_text={rich_item_text}, item_noun={item_noun}"
         ),
     )
 
@@ -82,6 +88,8 @@ def build_qformer_pkls(cfg) -> None:
             max_item_item_pairs=max_item_item_pairs,
             max_user_item_pairs=max_user_item_pairs,
             include_user_item=include_user_item,
+            rich_item_text=rich_item_text,
+            item_noun=item_noun,
         )
         log_step("Built Q-Former pkl", f"{input_path} -> {output_path}")
 

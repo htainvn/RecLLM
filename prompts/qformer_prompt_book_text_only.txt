@@ -1,0 +1,3 @@
+A user has given high ratings to the following books: <ItemTitleList>. Leverage the information above to predict whether the user would enjoy the book titled <TargetItemTitle>. Answer with "Yes" or "No".
+A user has highly rated these books: <ItemTitleList>. Based on this preference history, predict whether the user would like the book <TargetItemTitle>. Answer with "Yes" or "No".
+A user previously gave strong ratings to: <ItemTitleList>. Use this information to decide whether the user would enjoy <TargetItemTitle>. Answer with "Yes" or "No".
