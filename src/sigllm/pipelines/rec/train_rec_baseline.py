@@ -254,29 +254,39 @@ def train_baseline_model(
     #5. Training loop
     for epoch in range(train_config['epoch']):
         model.train()
+        epoch_loss, n_batches = 0.0, 0
         for batch_data in train_loader:
             batch_data = batch_data.to(device)
             optimizer.zero_grad()
-            
+
             ui_matching = model(batch_data[:, 0].long(), batch_data[:, 1].long())
             loss = criterion(ui_matching.squeeze(), batch_data[:, -1].float())
 
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
+            n_batches += 1
+        avg_loss = epoch_loss / max(n_batches, 1)
 
         if epoch % train_config['eval_epoch'] == 0:
             v_users, v_preds, v_labels = get_model_predictions(model, valid_loader, device)
             valid_auc = roc_auc_score(v_labels, v_preds)
             valid_uauc, _, _ = calculate_user_auc(v_users, v_preds, v_labels)
-            
+
             t_users, t_preds, t_labels = get_model_predictions(model, test_loader, device)
             test_auc = roc_auc_score(t_labels, t_preds)
             test_uauc, _, _ = calculate_user_auc(t_users, t_preds, t_labels)
 
+            # Train AUC on the train predictions -> separates "not fitting"
+            # (optimizer/gradient bug) from "fits train but not valid" (overfit).
+            tr_users, tr_preds, tr_labels = get_model_predictions(model, train_loader, device)
+            train_auc = roc_auc_score(tr_labels, tr_preds)
+            pred_std = float(np.std(tr_preds))
+
             threshold = 0.1
             acc = ((v_preds >= threshold) == v_labels).mean()
-            
-            log_step(f"Epoch {epoch}: Valid AUC: {valid_auc:.4f}, Valid uAUC: {valid_uauc:.4f}, Test AUC: {test_auc:.4f}, Test uAUC: {test_uauc:.4f}, Acc: {acc:.4f}")
+
+            log_step(f"Epoch {epoch}: loss={avg_loss:.4f}, Train AUC: {train_auc:.4f}, pred_std={pred_std:.4f}, Valid AUC: {valid_auc:.4f}, Valid uAUC: {valid_uauc:.4f}, Test AUC: {test_auc:.4f}, Test uAUC: {test_uauc:.4f}, Acc: {acc:.4f}")
 
             metrics = {
                 'valid_auc': valid_auc, 'valid_uauc': valid_uauc,
