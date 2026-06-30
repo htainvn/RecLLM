@@ -231,48 +231,45 @@ class QRecLLM(Rec2Base):
             self._soft_token_id = tok.unk_token_id
             return
 
-        skip_ids = {tok.eos_token_id, tok.pad_token_id, tok.bos_token_id}
-        skip_ids.discard(None)
-
-        # CHANGE C: never use a chat control token as the soft-token slot, or it
-        # would collide with the ChatML scaffolding in the prompt template and
-        # corrupt embeddings silently.
-        for ctrl in ("<|im_start|>", "<|im_end|>", "<|endoftext|>"):
-            ctrl_ids = tok(ctrl, add_special_tokens=False).input_ids
-            if len(ctrl_ids) == 1:
-                skip_ids.add(ctrl_ids[0])
-
-        hardcoded = (
-            "<|extra_0|>", "<|reserved_0|>", "<|fim_pad|>",
-            "<|object_ref_start|>", "<|object_ref_end|>",
-            "<|box_start|>", "<|box_end|>",
-            "<|quad_start|>", "<|quad_end|>",
-            "<|vision_start|>", "<|vision_end|>", "<|vision_pad|>",
-            "<|image_pad|>", "<|video_pad|>",
-        )
-        for candidate in hardcoded:
-            ids = tok(candidate, add_special_tokens=False).input_ids
-            if len(ids) == 1 and ids[0] not in skip_ids:
-                self._soft_token_str = candidate
-                self._soft_token_id = ids[0]
+        # No unk token (e.g. Qwen2). Register a DEDICATED reserved placeholder
+        # token that by construction cannot appear in the prompt body or the
+        # ChatML scaffolding. This is the standard BLIP-2/LLaVA approach and is
+        # collision-proof. The previous strategy scanned for an unused special
+        # token and, finding none on Qwen2-Instruct, fell back to eos_token
+        # (<|im_end|>) — which the chat template uses, so soft-slot matching
+        # also hit the scaffolding markers and the embedding-injection counts
+        # diverged (256 vs 288).
+        placeholder = "<|cf_slot|>"
+        try:
+            num_added = tok.add_tokens([placeholder], special_tokens=True)
+            new_id = tok.convert_tokens_to_ids(placeholder)
+            if new_id is not None and new_id != tok.unk_token_id:
+                emb = self.llm_model.get_input_embeddings()
+                emb_rows = emb.weight.size(0) if emb is not None else 0
+                if num_added > 0 and len(tok) > emb_rows:
+                    # Grow embeddings only when the new id exceeds existing rows
+                    # (Qwen2 already has spare rows, so this usually no-ops), then
+                    # re-freeze the (frozen base) embeddings.
+                    self.llm_model.resize_token_embeddings(len(tok))
+                    in_emb = self.llm_model.get_input_embeddings()
+                    if in_emb is not None:
+                        for p in in_emb.parameters():
+                            p.requires_grad = False
+                    out_emb = self.llm_model.get_output_embeddings()
+                    if out_emb is not None:
+                        for p in out_emb.parameters():
+                            p.requires_grad = False
+                self._soft_token_str = placeholder
+                self._soft_token_id = new_id
                 return
+        except Exception as exc:  # pragma: no cover - defensive
+            log_step("Soft-token placeholder add failed", str(exc))
 
-        added = getattr(tok, "added_tokens_decoder", None) or {}
-        for token_id, added_token in added.items():
-            if token_id in skip_ids:
-                continue
-            content = getattr(added_token, "content", str(added_token))
-            ids = tok(content, add_special_tokens=False).input_ids
-            if len(ids) == 1 and ids[0] == token_id:
-                self._soft_token_str = content
-                self._soft_token_id = token_id
-                return
-
+        # Last-resort fallback (should not be reached): eos.
         log_step(
             "Soft-token fallback",
-            "no unk_token and no safe single-token candidate; using eos_token "
-            "as soft-slot placeholder. Soft slots will COLLIDE with padding if "
-            "pad_token == eos_token — Step 2 may corrupt embeddings silently.",
+            "could not register a dedicated placeholder; using eos_token. Soft "
+            "slots may COLLIDE with chat/padding tokens and corrupt embeddings.",
         )
         self._soft_token_str = tok.eos_token
         self._soft_token_id = tok.eos_token_id
@@ -754,7 +751,17 @@ class QRecLLM(Rec2Base):
         replaced_idx = torch.nonzero(prompts_tokens.input_ids == unk_token_id)
 
         if "<CFTokens>" in prompt_ori and rec_embeds.get('merged_embs') is not None:
-            inputs_embeds[replaced_idx[:, 0], replaced_idx[:, 1]] = rec_embeds['merged_embs'].to(inputs_embeds)
+            merged = rec_embeds['merged_embs']
+            n_slots = replaced_idx.shape[0]
+            if n_slots != merged.shape[0]:
+                raise RuntimeError(
+                    f"Soft-token slot/embedding mismatch: found {n_slots} "
+                    f"'{self._soft_token_str}' slots in the tokenized prompt but have "
+                    f"{merged.shape[0]} soft embeddings ({batch_size} x {self.proj_token_num}). "
+                    f"The soft-token placeholder (id={self._soft_token_id}) likely collides "
+                    f"with a token used elsewhere in the prompt/chat template."
+                )
+            inputs_embeds[replaced_idx[:, 0], replaced_idx[:, 1]] = merged.to(inputs_embeds)
 
         if not self._has_logged_prompt_injection_stats:
             cf_soft_tokens = self.proj_token_num if "<CFTokens>" in prompt_ori else 0
