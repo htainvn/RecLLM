@@ -82,6 +82,30 @@ def _init_rec_model(cfg, device):
     return mf
 
 
+def _extract_qformer_state_dict(ckpt, qformer):
+    """Normalize a checkpoint into a bare HFQFormerAdapter state_dict.
+
+    Handles the three forms produced across stages:
+      1. bare adapter state_dict (Stage 1 `best_qformer_weights_name`, Stage 2 output);
+      2. wrapped full checkpoint {"epoch","model","optimizer",...} (Stage 1 `best_full`);
+      3. Stage-1 alignment-model state where the adapter lives under a `qformer.` prefix
+         alongside `mf.*` / `itm_head.*` (the inner InstructBLIP adds its own `qformer.`
+         keys, so the adapter shares a name with its parent attribute).
+    """
+    sd = ckpt
+    if isinstance(sd, dict) and "model" in sd and "epoch" in sd:
+        sd = sd["model"]
+    adapter_keys = set(qformer.state_dict().keys())
+    if not (adapter_keys & set(sd.keys())):
+        # No direct overlap -> the adapter is nested under a "qformer." prefix.
+        extracted = {
+            k[len("qformer."):]: v for k, v in sd.items() if k.startswith("qformer.")
+        }
+        if extracted:
+            sd = extracted
+    return sd
+
+
 def _init_qformer(cfg, device):
     qformer_output_dim = cfg.get("qformer_output_dim") or cfg.qformer_d_model
     qformer = HFQFormerAdapter(
@@ -98,7 +122,8 @@ def _init_qformer(cfg, device):
 
     ckpt_path = cfg.get("qformer_ckpt_in")
     if ckpt_path and os.path.exists(ckpt_path):
-        state_dict = torch.load(ckpt_path, map_location="cpu")
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        state_dict = _extract_qformer_state_dict(ckpt, qformer)
         qformer.load_state_dict(state_dict, strict=True)
         log_step("Loaded Phase 1 Q-Former", ckpt_path)
     else:

@@ -418,9 +418,24 @@ class QRecLLM(Rec2Base):
 
         if pretrained_qformer and pretrained_qformer != "not_have":
             ckpt = torch.load(pretrained_qformer, map_location="cpu")
+            # Normalize: unwrap a {"epoch","model",...} checkpoint, and if the
+            # adapter is nested under a "qformer." prefix (Stage-1 alignment
+            # state), extract just that submodule. A bare adapter state_dict
+            # (Stage 2 output) is used as-is. The previous global
+            # replace("qformer.", "", 1) corrupted bare adapters, whose inner
+            # InstructBLIP legitimately uses "qformer.*" keys.
             state_dict = ckpt
-            if isinstance(state_dict, dict) and any(k.startswith("qformer.") for k in state_dict.keys()):
-                state_dict = {k.replace("qformer.", "", 1): v for k, v in state_dict.items()}
+            if isinstance(state_dict, dict) and "model" in state_dict and "epoch" in state_dict:
+                state_dict = state_dict["model"]
+            adapter_keys = set(self.qformer.state_dict().keys())
+            if not (adapter_keys & set(state_dict.keys())):
+                extracted = {
+                    k[len("qformer."):]: v
+                    for k, v in state_dict.items()
+                    if k.startswith("qformer.")
+                }
+                if extracted:
+                    state_dict = extracted
             self.qformer.load_state_dict(state_dict, strict=True)
             log_step("Successfully loaded QFormer checkpoint", pretrained_qformer)
 
