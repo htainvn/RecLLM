@@ -127,16 +127,23 @@ class QRecInstructAlignmentModel(nn.Module):
         item_ids: torch.Tensor,
         text_list,
         itc_sim_matrix: torch.Tensor,
+        num_neg: int = 1,
     ):
         """ITM: binary item-text matching with hard negatives mined from the
         ITC similarity matrix.
 
         ``itc_sim_matrix`` is the similarity matrix returned by ``loss_itc``;
-        we mask the diagonal and sample one hard negative text per item and
-        one hard negative item per text.
+        we mask the diagonal and sample ``num_neg`` hard negative texts per item
+        and ``num_neg`` hard negative items per text (CHANGE 2e). With the
+        default ``num_neg=1`` this is the original BLIP-2 single-hard-negative
+        ITM; larger values give the matching head more (and harder) contrastive
+        pressure, which matters when item-text batches are small.
         """
         batch_size = item_ids.size(0)
         device = item_ids.device
+
+        # Can draw at most batch_size-1 distinct off-diagonal negatives per row.
+        k = max(1, min(int(num_neg), batch_size - 1))
 
         weights_t2q = F.softmax(itc_sim_matrix, dim=0) + 1e-4
         weights_q2t = F.softmax(itc_sim_matrix, dim=1) + 1e-4
@@ -144,18 +151,24 @@ class QRecInstructAlignmentModel(nn.Module):
         weights_t2q = weights_t2q.masked_fill(diag, 0.0)
         weights_q2t = weights_q2t.masked_fill(diag, 0.0)
 
-        neg_text_idx = torch.multinomial(weights_q2t, 1).squeeze(1)
-        neg_item_idx = torch.multinomial(weights_t2q.T, 1).squeeze(1)
+        # [B, k] hard negatives (sampled without replacement within each row).
+        neg_text_idx = torch.multinomial(weights_q2t, k, replacement=False)
+        neg_item_idx = torch.multinomial(weights_t2q.T, k, replacement=False)
 
-        pos_item_cf = self.mf.item_encoder(item_ids)
-        neg_item_cf = self.mf.item_encoder(item_ids[neg_item_idx])
+        pos_item_cf = self.mf.item_encoder(item_ids)                       # [B, d]
+        # Negative-text branch: positive item repeated k times, paired with k
+        # hard-negative texts. repeat_interleave matches the row-major (b, j)
+        # flattening of neg_text_idx so item b lines up with its k neg texts.
+        item_cf_for_neg_text = pos_item_cf.repeat_interleave(k, dim=0)     # [B*k, d]
+        neg_item_cf = self.mf.item_encoder(item_ids[neg_item_idx.reshape(-1)])  # [B*k, d]
 
         text_list_local = list(text_list)
         pos_text = text_list_local
-        neg_text = [text_list_local[i] for i in neg_text_idx.detach().cpu().tolist()]
+        neg_text_flat = [text_list_local[i] for i in neg_text_idx.reshape(-1).detach().cpu().tolist()]
+        pos_text_for_neg_item = [text_list_local[b] for b in range(batch_size) for _ in range(k)]
 
-        cf_concat = torch.cat([pos_item_cf, pos_item_cf, neg_item_cf], dim=0)
-        text_concat = pos_text + neg_text + pos_text
+        cf_concat = torch.cat([pos_item_cf, item_cf_for_neg_text, neg_item_cf], dim=0)
+        text_concat = pos_text + neg_text_flat + pos_text_for_neg_item
 
         user_cf, target_cf, history_cf, history_mask, u_mask, t_mask = (
             self.qformer.pack_item_context(cf_concat)
@@ -171,7 +184,7 @@ class QRecInstructAlignmentModel(nn.Module):
         labels = torch.cat(
             [
                 torch.ones(batch_size, dtype=torch.long, device=device),
-                torch.zeros(2 * batch_size, dtype=torch.long, device=device),
+                torch.zeros(2 * batch_size * k, dtype=torch.long, device=device),
             ],
             dim=0,
         )

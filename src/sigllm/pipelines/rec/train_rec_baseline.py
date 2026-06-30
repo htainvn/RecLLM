@@ -75,6 +75,58 @@ def calculate_user_auc(user_ids, y_pred, y_true):
 
     return avg_uauc, computed_users, auc_array
 
+
+def calculate_stratified_uauc(
+    user_ids,
+    item_ids,
+    y_pred,
+    y_true,
+    item_train_counts,
+    bins=((0, 5), (5, 20), (20, float("inf"))),
+    bin_labels=("cold(<5)", "sparse(5-20)", "popular(>=20)"),
+):
+    """CHANGE 2b: uAUC sliced by target-item popularity (train frequency).
+
+    LLM-rec gains tend to concentrate where collaborative signal is weak, so a
+    single aggregate uAUC hides the regime that matters. This computes uAUC over
+    the interactions whose *target item* falls in each popularity bucket, plus a
+    cold-weighted mean that upweights sparse buckets.
+
+    Parameters
+    ----------
+    item_train_counts : dict[int, int]
+        Per-item interaction count in the TRAIN split (use ``df.iid.value_counts()``).
+    bins / bin_labels : popularity ranges ``[lo, hi)`` and their display names.
+
+    Returns ``{label: uauc, ..., "cold_weighted": float}``.
+    """
+    user_ids = np.asarray(user_ids)
+    item_ids = np.asarray(item_ids)
+    y_pred = np.asarray(y_pred).squeeze()
+    y_true = np.asarray(y_true).squeeze()
+
+    counts = np.array([item_train_counts.get(int(i), 0) for i in item_ids])
+    results = {}
+    per_bin_uauc = []
+    for (lo, hi), label in zip(bins, bin_labels):
+        mask = (counts >= lo) & (counts < hi)
+        n = int(mask.sum())
+        if n == 0:
+            results[label] = float("nan")
+            log_step(f"uAUC[{label}]", "no samples")
+            continue
+        uauc, _, _ = calculate_user_auc(user_ids[mask], y_pred[mask], y_true[mask])
+        results[label] = float(uauc)
+        per_bin_uauc.append(float(uauc))
+        log_step(f"uAUC[{label}]", f"{uauc:.6f} (n={n})")
+
+    # Cold-weighted mean: average of per-bucket uAUC (equal weight per regime),
+    # which weights the sparse buckets far more than their sample share would.
+    if per_bin_uauc:
+        results["cold_weighted"] = float(np.nanmean(per_bin_uauc))
+        log_step("uAUC[cold_weighted]", f"{results['cold_weighted']:.6f}")
+    return results
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -164,6 +216,21 @@ def train_baseline_model(
     stopper = EarlyStopping(ref_metric='valid_auc', monitor_mode='max', patience=train_config['patience'])
     criterion = nn.BCEWithLogitsLoss()
 
+    # CHANGE 2b: popularity-stratified uAUC on the FULL test split (independent
+    # of the warm/cold filter above). Loader order == array row order under
+    # shuffle=False, so test items align with predictions row-for-row.
+    def _report_stratified_uauc():
+        try:
+            train_full = pd.read_pickle(os.path.join(data_dir, "train_ood2.pkl"))
+            item_counts = train_full["iid"].value_counts().to_dict()
+            full_test = pd.read_pickle(os.path.join(data_dir, "test_ood2.pkl"))[["uid", "iid", "label"]].values
+            ft_loader = DataLoader(full_test, batch_size=train_config["batch_size"], shuffle=False)
+            ft_users, ft_preds, ft_labels = get_model_predictions(model, ft_loader, device)
+            log_step("Stratified uAUC by item popularity (full test)")
+            calculate_stratified_uauc(ft_users, full_test[:, 1], ft_preds, ft_labels, item_counts)
+        except Exception as exc:  # pragma: no cover - reporting must never break training
+            log_step("stratified uAUC skipped", str(exc))
+
     #4. Inference only
     if not need_train:
         log_step("Starting evaluation only mode.")
@@ -181,8 +248,9 @@ def train_baseline_model(
         acc = ((v_preds >= threshold) == v_labels).mean()
         
         log_step(f"Valid AUC: {valid_auc:.4f}, Valid uAUC: {valid_uauc:.4f}, Test AUC: {test_auc:.4f}, Test uAUC: {test_uauc:.4f}, Acc: {acc:.4f}")
+        _report_stratified_uauc()
         return
-    
+
     #5. Training loop
     for epoch in range(train_config['epoch']):
         model.train()
@@ -232,6 +300,9 @@ def train_baseline_model(
                 break
 
     # 6. Final Logging
+    if save_file is not None and os.path.exists(save_file):
+        model.load_state_dict(torch.load(save_file))  # best checkpoint for stratified report
+    _report_stratified_uauc()
     final_log = f"Train Config: {train_config}\nBest Results: {stopper.best_full_metric}"
     log_step(final_log)
 

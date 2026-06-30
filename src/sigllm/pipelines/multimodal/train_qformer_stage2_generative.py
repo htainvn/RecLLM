@@ -32,6 +32,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenize
 
 from sigllm.common import EarlyStopping, NotebookLogger
 from sigllm.common.config import Config
+from sigllm.datasets.qformer.qformer_alignment_builder import QFormerAlignmentBuilder
 from sigllm.datasets.qformer.qformer_alignment_dataset import QFormerAlignmentDataset
 from sigllm.datasets.qformer.qformer_loader import build_qformer_loader
 from sigllm.models.q_former.hf_qformer_adapter import HFQFormerAdapter
@@ -231,18 +232,42 @@ def _move_batch_to_device(batch, device):
     return batch
 
 
-def forward_stage2(batch, mf, qformer, llm_proj, tokenizer, llm, max_caption_length: int):
+def _build_stage2_instructions(batch_size: int, training: bool) -> list:
+    """Item-text instructions for the Q-Former, drawn from the SAME templates
+    Stage 1 used (``QFormerAlignmentBuilder.TEMPL_ITEM_TEXT``) so Stage 2 sees
+    the instruction distribution it was aligned on. Fresh per row in training,
+    deterministic (template 0) at eval."""
+    templates = QFormerAlignmentBuilder.TEMPL_ITEM_TEXT
+    if training:
+        return random.choices(templates, k=batch_size)
+    return [templates[0]] * batch_size
+
+
+def forward_stage2(
+    batch, mf, qformer, llm_proj, tokenizer, llm, max_caption_length: int,
+    input_mode: str = "multimodal", training: bool = True,
+):
     item_ids = batch["i_left"]
     captions = batch["text"]
 
     with torch.no_grad():
         item_cf = mf.item_encoder(item_ids)
 
-    # BLIP-2-style generative pretraining: queries cross-attend to the CF
-    # vector only, no text input to the Q-Former. Instruction-awareness is
-    # deferred to Stage 3 (instruction tuning).
-    query_tokens = qformer.encode_cf(*qformer.pack_item_context(item_cf))
-    query_tokens = qformer.out_proj(query_tokens)
+    ctx = qformer.pack_item_context(item_cf)
+    if input_mode == "multimodal":
+        # CHANGE 2g: run the Q-Former through the SAME instruction-aware joint
+        # forward used at Stage 3 (queries + instruction text cross-attending the
+        # CF sequence), instead of the uni-modal queries-only ``encode_cf``. This
+        # removes the Stage-2 vs Stage-3 input mismatch, so the projection the
+        # LLM consumes is produced by the same code path in both stages.
+        # ``qformer(...)`` already applies ``out_proj``.
+        instructions = _build_stage2_instructions(item_ids.size(0), training)
+        query_tokens = qformer(ctx[0], ctx[1], ctx[2], ctx[3], instructions, user_mask=ctx[4], target_mask=ctx[5])
+    else:
+        # Legacy BLIP-2 uni-modal pretraining (queries cross-attend the CF
+        # vector only, no text input). Kept for ablation / reproducibility.
+        query_tokens = qformer.encode_cf(*ctx)
+        query_tokens = qformer.out_proj(query_tokens)
     soft_tokens = llm_proj(query_tokens)
 
     llm_dtype = next(llm.parameters()).dtype
@@ -267,7 +292,8 @@ def forward_stage2(batch, mf, qformer, llm_proj, tokenizer, llm, max_caption_len
     return outputs.loss
 
 
-def evaluate(loader, mf, qformer, llm_proj, tokenizer, llm, device, max_caption_length: int):
+def evaluate(loader, mf, qformer, llm_proj, tokenizer, llm, device, max_caption_length: int,
+             input_mode: str = "multimodal"):
     qformer.eval()
     llm_proj.eval()
     total = 0.0
@@ -276,7 +302,8 @@ def evaluate(loader, mf, qformer, llm_proj, tokenizer, llm, device, max_caption_
         for batch in loader:
             batch = _move_batch_to_device(batch, device)
             loss = forward_stage2(
-                batch, mf, qformer, llm_proj, tokenizer, llm, max_caption_length
+                batch, mf, qformer, llm_proj, tokenizer, llm, max_caption_length,
+                input_mode=input_mode, training=False,
             )
             total += float(loss.item())
             steps += 1
@@ -340,6 +367,10 @@ def train_qformer_stage2_generative(cfg):
 
     max_caption_length = int(cfg.get("max_caption_length", 64))
     log_epoch = int(cfg.get("log_epoch", 1))
+    # CHANGE 2g: "multimodal" (default) matches the Stage-3 forward path;
+    # "unimodal" reproduces the legacy BLIP-2 queries-only pretraining.
+    input_mode = str(cfg.get("qformer_input_mode", "multimodal"))
+    log_step("Stage 2 Q-Former input mode", input_mode)
 
     for epoch in range(int(cfg.epoch)):
         qformer.train()
@@ -350,7 +381,8 @@ def train_qformer_stage2_generative(cfg):
             batch = _move_batch_to_device(batch, device)
             optimizer.zero_grad()
             loss = forward_stage2(
-                batch, mf, qformer, llm_proj, tokenizer, llm, max_caption_length
+                batch, mf, qformer, llm_proj, tokenizer, llm, max_caption_length,
+                input_mode=input_mode, training=True,
             )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -363,7 +395,8 @@ def train_qformer_stage2_generative(cfg):
             continue
 
         val_loss = evaluate(
-            valid_loader, mf, qformer, llm_proj, tokenizer, llm, device, max_caption_length
+            valid_loader, mf, qformer, llm_proj, tokenizer, llm, device, max_caption_length,
+            input_mode=input_mode,
         )
         print(
             f"epoch {epoch + 1} | train_loss={avg_train_loss:.4f} | val_loss={val_loss:.4f}"

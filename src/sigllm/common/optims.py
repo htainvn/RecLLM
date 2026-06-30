@@ -47,16 +47,21 @@ class LinearWarmupCosineLRScheduler:
 
 
 def cosine_lr_schedule(optimizer, epoch, max_epoch, init_lr, min_lr):
-    """Decay the learning rate"""
+    """Decay the learning rate.
+
+    CHANGE 2i: honor a per-group ``lr_scale`` (set by ``build_optimizer`` for the
+    Q-Former/projection bridge) so the multiplier survives scheduling instead of
+    being overwritten with a single global lr.
+    """
     lr = (init_lr - min_lr) * 0.5 * (
         1.0 + math.cos(math.pi * epoch / max_epoch)
     ) + min_lr
     for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
+        param_group["lr"] = lr * param_group.get("lr_scale", 1.0)
 
 
 def warmup_lr_schedule(optimizer, step, max_step, init_lr, max_lr):
-    """Warmup the learning rate"""
+    """Warmup the learning rate (honors per-group ``lr_scale``; see CHANGE 2i)."""
     lr = min(max_lr, init_lr + (max_lr - init_lr) * step / max(max_step, 1))
     for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
+        param_group["lr"] = lr * param_group.get("lr_scale", 1.0)

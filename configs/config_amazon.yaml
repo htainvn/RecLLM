@@ -109,6 +109,13 @@ run:
     # CHANGE 2d: domain-aware richer item text for the ITC/ITM/ITG objectives.
     rich_item_text: True
     item_noun: "book"
+    # CHANGE 2e: more (and harder) ITM negatives. 1 = legacy BLIP-2 behavior.
+    itm_num_neg: 4
+    # CHANGE 2f: guarantee >=min_item_text item-text rows per Stage-1 train batch
+    # so ITC/ITM/ITG fire with enough in-batch negatives (fixes the starvation
+    # noted above). Applies to the train loader only.
+    balanced_batches: True
+    min_item_text_per_batch: 64
     lr: 5e-5
     w_itc: 1.0
     w_itm: 1.0
@@ -150,6 +157,9 @@ run:
     qformer_ckpt_in: "${run.qformer_stage1.output_dir}${run.qformer_stage1.best_qformer_weights_name}"
     qformer_ckpt_out: "qformer_stage2_best_qformer.pth"
     proj_ckpt_out: "qformer_stage2_best_proj.pth"
+    # CHANGE 2g: run the Q-Former through the Stage-3 instruction-aware forward
+    # path during generative pretraining ("multimodal"). "unimodal" = legacy.
+    qformer_input_mode: "multimodal"
     output_dir: "/content/SigLLM/ckpt/qformer_stage2_amazon/"
     lr: 1e-4
     weight_decay: 1e-3
@@ -179,6 +189,10 @@ run:
   warmup_lr: 1e-5
   weight_decay: 1e-3
   amp: True
+  # CHANGE 2i: extra LR for the Q-Former/projection bridge (lr = init_lr * mult,
+  # honored across warmup+cosine). 1.0 = off. Raise (e.g. 3-5) to push more
+  # gradient/step into the bridge under the frozen LLM; sweep and watch val uAUC.
+  qformer_lr_mult: 1.0
 
   max_epoch: 200
   iters_per_epoch: 400

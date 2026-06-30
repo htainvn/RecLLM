@@ -150,6 +150,7 @@ def train_step(
     tau_itc: float = 0.07,
     tau_ii: float = 0.07,
     tau_ui: float = 0.07,
+    itm_num_neg: int = 1,
     debug_batch: bool = False,
 ):
     """BLIP-2 stage-1 step: ITC + ITM + ITG on item-text samples, plus the
@@ -187,7 +188,7 @@ def train_step(
         losses.append(w_itc * loss_itc)
 
         if w_itm > 0.0:
-            loss_itm, itm_acc = model.loss_itm(item_ids, text_list, sim_matrix)
+            loss_itm, itm_acc = model.loss_itm(item_ids, text_list, sim_matrix, num_neg=itm_num_neg)
             logs["L_itm"] = loss_itm
             logs["itm_acc"] = itm_acc.detach()
             losses.append(w_itm * loss_itm)
@@ -233,6 +234,7 @@ def evaluate_loss(
     tau_itc=0.07,
     tau_ii=0.07,
     tau_ui=0.07,
+    itm_num_neg=1,
 ):
     model.eval()
     device = next(model.parameters()).device
@@ -265,6 +267,7 @@ def evaluate_loss(
                 tau_itc=tau_itc,
                 tau_ii=tau_ii,
                 tau_ui=tau_ui,
+                itm_num_neg=itm_num_neg,
             )
             totals["loss"] += loss.item()
             for key in logs:
@@ -328,9 +331,15 @@ def train_qformer_stage1_representation(cfg):
 
     w_ui = float(cfg.get("w_ui", 0.0))
     tau_ui = float(cfg.get("tau_ui", 0.07))
+    itm_num_neg = int(cfg.get("itm_num_neg", 1))  # CHANGE 2e
 
     for epoch in range(cfg.epoch):
         model.train()
+        # CHANGE 2f: reshuffle the balanced batch sampler each epoch (no-op for
+        # the default DataLoader batch_sampler, which has no set_epoch).
+        batch_sampler = getattr(train_loader, "batch_sampler", None)
+        if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
+            batch_sampler.set_epoch(epoch)
         train_totals = {
             "loss": 0.0,
             "L_itc": 0.0,
@@ -360,6 +369,7 @@ def train_qformer_stage1_representation(cfg):
                 tau_itc=cfg.tau_itc,
                 tau_ii=cfg.tau_ii,
                 tau_ui=tau_ui,
+                itm_num_neg=itm_num_neg,
                 debug_batch=cfg.debug_batch and epoch == 0 and train_steps < cfg.debug_batch_max_steps,
             )
             loss.backward()
@@ -386,6 +396,7 @@ def train_qformer_stage1_representation(cfg):
                 tau_itc=cfg.tau_itc,
                 tau_ii=cfg.tau_ii,
                 tau_ui=tau_ui,
+                itm_num_neg=itm_num_neg,
             )
             print(
                 f"epoch {epoch+1} | "
@@ -466,6 +477,7 @@ def train_qformer_stage1_representation(cfg):
         w_ii=cfg.w_ii,
         tau_itc=cfg.tau_itc,
         tau_ii=cfg.tau_ii,
+        itm_num_neg=itm_num_neg,
     )
     log_step(
         "Test results",
