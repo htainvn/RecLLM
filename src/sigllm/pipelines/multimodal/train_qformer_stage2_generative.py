@@ -367,6 +367,9 @@ def train_qformer_stage2_generative(cfg):
 
     max_caption_length = int(cfg.get("max_caption_length", 64))
     log_epoch = int(cfg.get("log_epoch", 1))
+    # Per-step progress so long epochs aren't silent (metrics still log per epoch).
+    log_every = int(cfg.get("log_every_n_steps", 50))
+    total_batches = len(train_loader) if hasattr(train_loader, "__len__") else None
     # CHANGE 2g: "multimodal" (default) matches the Stage-3 forward path;
     # "unimodal" reproduces the legacy BLIP-2 queries-only pretraining.
     input_mode = str(cfg.get("qformer_input_mode", "multimodal"))
@@ -389,6 +392,13 @@ def train_qformer_stage2_generative(cfg):
             scaler.update()
             train_total += float(loss.item())
             train_steps += 1
+
+            if log_every > 0 and (train_steps == 1 or train_steps % log_every == 0):
+                denom = f"/{total_batches}" if total_batches else ""
+                log_step(
+                    f"epoch {epoch + 1}/{int(cfg.epoch)} step {train_steps}{denom}",
+                    f"loss={loss.item():.4f} (running avg {train_total / train_steps:.4f})",
+                )
 
         avg_train_loss = train_total / max(train_steps, 1)
         if (epoch + 1) % log_epoch != 0:
