@@ -13,7 +13,7 @@ from sigllm.common.dist_utils import *
 from sigllm.common.logger import MetricLogger, SmoothedValue
 from sigllm.common.logging_utils import NotebookLogger
 from sigllm.models.multimodal.qformer_rec_llm import QRecLLM
-from sigllm.pipelines.rec.train_rec_baseline import calculate_user_auc
+from sigllm.pipelines.rec.train_rec_baseline import calculate_user_auc, build_user_interaction_counts
 
 LOGGER = NotebookLogger.rich_logger("sigllm.tasks.base.rec_base_task")
 
@@ -57,6 +57,27 @@ class RecBaseTask:
                 if 'sample_ratio' in dataset_config:
                     dataset['train'].sample_ratio = dataset_config.sample_ratio
             datasets[name] = dataset
+
+        # Best-checkpoint / early-stop selection metric (default 'auc'; 'uauc' to
+        # target per-user AUC). Set via run.best_metric in the config.
+        self._best_metric = str(cfg.run_cfg.get("best_metric", "auc")).lower()
+
+        # uAUC protocol filter (SeLLa-Rec averages only over users with >N
+        # interactions). 0 = off (default) -> uAUC over all eligible users, as before.
+        self._uauc_min_interactions = int(cfg.run_cfg.get("uauc_min_interactions", 0))
+        self._uauc_counts = None
+        if self._uauc_min_interactions > 0:
+            data_path = None
+            for _, dcfg in datasets_config.items():
+                data_path = dcfg.get("path") or dcfg.get("build_info", {}).get("storage")
+                if data_path:
+                    break
+            if data_path:
+                self._uauc_counts = build_user_interaction_counts(data_path)
+                logging.info(
+                    f"uAUC filter ON: keep users with >{self._uauc_min_interactions} "
+                    f"interactions ({len(self._uauc_counts)} users counted from {data_path})"
+                )
 
         return datasets
     
@@ -193,8 +214,14 @@ class RecBaseTask:
                 ),
             )
             
+            # Metric that drives best-checkpoint selection / early stop (higher=better).
+            # Default 'auc' (legacy); set run.best_metric='uauc' to optimize per-user AUC.
+            best_metric = getattr(self, "_best_metric", "auc")
+            agg = metrics.get(best_metric)
+            if agg is None:
+                agg = -metric_logger.meters['loss'].global_avg
             all_results = {
-            'agg_metrics': metrics.get('auc', -metric_logger.meters['loss'].global_avg),
+            'agg_metrics': agg,
             'auc': metrics.get('auc', 0),
             'acc': val_acc,
             'loss': val_loss,
@@ -258,7 +285,11 @@ class RecBaseTask:
         neg_mask = labels == 0
 
         auc = roc_auc_score(labels, scores)
-        uauc, _, _ = calculate_user_auc(data['users'], scores, labels)
+        uauc, _, _ = calculate_user_auc(
+            data['users'], scores, labels,
+            interaction_counts=getattr(self, "_uauc_counts", None),
+            min_interactions=getattr(self, "_uauc_min_interactions", 0),
+        )
 
         pos_score_mean = float(scores[pos_mask].mean()) if pos_mask.any() else 0.0
         neg_score_mean = float(scores[neg_mask].mean()) if neg_mask.any() else 0.0

@@ -4,4 +4,4 @@ scikit-learn
 webdataset
 timm
 transformers==4.44.2  # pin: InstructBlip Q-Former mask routing broke in the ~4.49+ refactor; 4.44.2 also supports Qwen2 (>=4.37)
-peft
+peft==0.12.0          # pin: newer peft raises on Colab's torchao==0.10.0 during LoRA dispatch; 0.12.0 matches the transformers 4.44 era

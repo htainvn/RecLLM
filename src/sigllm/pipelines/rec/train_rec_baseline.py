@@ -23,9 +23,32 @@ def log_step(title: str, detail: Optional[str] = None) -> None:
     message = title if detail is None else f"{title} | {detail}"
     LOGGER.info(message)
 
-def calculate_user_auc(user_ids, y_pred, y_true):
-    """Calculate User AUC (uAUC) for recommendation tasks."""
-    
+def build_user_interaction_counts(data_dir, splits=("train",)):
+    """Per-user interaction counts from the given split pkls (default: train).
+
+    Used to reproduce SeLLa-Rec's uAUC protocol, which averages only over users
+    with >20 interactions. Returns {uid(int): count(int)}.
+    """
+    counts = {}
+    for split in splits:
+        path = os.path.join(data_dir, f"{split}_ood2.pkl")
+        if not os.path.exists(path):
+            continue
+        vc = pd.read_pickle(path)["uid"].value_counts()
+        for uid, c in vc.items():
+            counts[int(uid)] = counts.get(int(uid), 0) + int(c)
+    return counts
+
+
+def calculate_user_auc(user_ids, y_pred, y_true, interaction_counts=None, min_interactions=0):
+    """Calculate User AUC (uAUC) for recommendation tasks.
+
+    ``min_interactions``/``interaction_counts`` reproduce SeLLa-Rec's protocol:
+    when both are set, a user is included only if its interaction count
+    (from ``interaction_counts``, typically the train split) is STRICTLY greater
+    than ``min_interactions`` (so min_interactions=20 keeps users with >20).
+    """
+
     y_pred = np.asarray(y_pred).squeeze()
     y_true = np.asarray(y_true).squeeze()
     user_ids = np.asarray(user_ids)
@@ -39,7 +62,9 @@ def calculate_user_auc(user_ids, y_pred, y_true):
     computed_users = []
     only_one_interaction = 0
     only_one_class = 0
+    below_min_interactions = 0
     current_pos = 0
+    filter_on = min_interactions > 0 and interaction_counts is not None
 
     for i, user_id in enumerate(users):
         user_count = counts[i]
@@ -49,6 +74,11 @@ def calculate_user_auc(user_ids, y_pred, y_true):
         user_y_pred = y_pred[user_indices]
 
         current_pos += user_count
+
+        # SeLLa-Rec protocol: keep only users with >min_interactions total interactions.
+        if filter_on and interaction_counts.get(int(user_id), 0) <= min_interactions:
+            below_min_interactions += 1
+            continue
 
         if user_count < 2:
             only_one_interaction += 1
@@ -63,7 +93,9 @@ def calculate_user_auc(user_ids, y_pred, y_true):
         computed_users.append(user_id)
 
     auc_array = np.array(auc_list)
-    avg_uauc = auc_array.mean()
+    avg_uauc = auc_array.mean() if auc_array.size else float("nan")
+    if filter_on:
+        log_step(f"Users below >{min_interactions} interactions (excluded)", str(below_min_interactions))
     log_step("Users with only one interaction", str(only_one_interaction))
     log_step("Users with only one class", str(only_one_class))
     log_step("Computed user AUC count", str(len(auc_list)))
@@ -190,6 +222,10 @@ def train_baseline_model(
     log_step("User num:", str(user_num))
     log_step("Item num:", str(item_num))
 
+    # SeLLa-Rec uAUC protocol: average only over users with >N interactions. 0 = off.
+    uauc_min = int(train_config.get("uauc_min_interactions", 0))
+    uauc_counts = build_user_interaction_counts(data_dir) if uauc_min > 0 else None
+
     if warm_or_cold is not None:
         if warm_or_cold == 'warm':
             test_data = pd.read_pickle(os.path.join(data_dir, "test_warm_cold_ood2.pkl"))[['uid','iid','label', 'warm']]
@@ -238,11 +274,11 @@ def train_baseline_model(
         
         v_users, v_preds, v_labels = get_model_predictions(model, valid_loader, device)
         valid_auc = roc_auc_score(v_labels, v_preds)
-        valid_uauc, _, _ = calculate_user_auc(v_users, v_preds, v_labels)
+        valid_uauc, _, _ = calculate_user_auc(v_users, v_preds, v_labels, interaction_counts=uauc_counts, min_interactions=uauc_min)
         
         t_users, t_preds, t_labels = get_model_predictions(model, test_loader, device)
         test_auc = roc_auc_score(t_labels, t_preds)
-        test_uauc, _, _ = calculate_user_auc(t_users, t_preds, t_labels)
+        test_uauc, _, _ = calculate_user_auc(t_users, t_preds, t_labels, interaction_counts=uauc_counts, min_interactions=uauc_min)
 
         threshold = 0.1
         acc = ((v_preds >= threshold) == v_labels).mean()
@@ -271,11 +307,11 @@ def train_baseline_model(
         if epoch % train_config['eval_epoch'] == 0:
             v_users, v_preds, v_labels = get_model_predictions(model, valid_loader, device)
             valid_auc = roc_auc_score(v_labels, v_preds)
-            valid_uauc, _, _ = calculate_user_auc(v_users, v_preds, v_labels)
+            valid_uauc, _, _ = calculate_user_auc(v_users, v_preds, v_labels, interaction_counts=uauc_counts, min_interactions=uauc_min)
 
             t_users, t_preds, t_labels = get_model_predictions(model, test_loader, device)
             test_auc = roc_auc_score(t_labels, t_preds)
-            test_uauc, _, _ = calculate_user_auc(t_users, t_preds, t_labels)
+            test_uauc, _, _ = calculate_user_auc(t_users, t_preds, t_labels, interaction_counts=uauc_counts, min_interactions=uauc_min)
 
             # Train AUC on the train predictions -> separates "not fitting"
             # (optimizer/gradient bug) from "fits train but not valid" (overfit).

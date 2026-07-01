@@ -76,7 +76,15 @@ run:
   output_dir: "ckpt/qformer_stage3_default_amazon"
   device: "cuda"
   seed: 42
+  # Best-checkpoint / early-stop selection metric: 'auc' (legacy) or 'uauc'.
+  # uAUC is the headline vs SeLLa-Rec, and AUC/uAUC are decoupled on this split,
+  # so select on uAUC to save the uAUC-best checkpoint.
+  best_metric: uauc
+  # SeLLa-Rec uAUC protocol: average uAUC only over users with >N interactions
+  # (counted from the train split). 0 = off (uAUC over all eligible users).
+  uauc_min_interactions: 20
   rec_baseline:
+    uauc_min_interactions: 20   # same protocol for the MF baseline (validate MF uAUC ~0.5366)
     save_file: ${model.rec_config.pretrained_path}
     need_train: True
     warm_or_cold: "warm"
