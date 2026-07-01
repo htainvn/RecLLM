@@ -333,6 +333,10 @@ def train_qformer_stage1_representation(cfg):
     tau_ui = float(cfg.get("tau_ui", 0.07))
     itm_num_neg = int(cfg.get("itm_num_neg", 1))  # CHANGE 2e
 
+    # Per-step progress so long epochs aren't silent (metrics still log per epoch).
+    log_every = int(cfg.get("log_every_n_steps", 50))
+    total_batches = len(train_loader) if hasattr(train_loader, "__len__") else None
+
     for epoch in range(cfg.epoch):
         model.train()
         # CHANGE 2f: reshuffle the balanced batch sampler each epoch (no-op for
@@ -379,6 +383,13 @@ def train_qformer_stage1_representation(cfg):
             for key in logs:
                 train_totals[key] += logs[key].item()
             train_steps += 1
+
+            if log_every > 0 and (train_steps == 1 or train_steps % log_every == 0):
+                denom = f"/{total_batches}" if total_batches else ""
+                log_step(
+                    f"epoch {epoch + 1}/{cfg.epoch} step {train_steps}{denom}",
+                    f"loss={loss.item():.4f} (running avg {train_totals['loss'] / train_steps:.4f})",
+                )
 
         if (epoch + 1) % cfg.log_epoch == 0:
             avg_train = {
