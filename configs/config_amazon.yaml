@@ -95,9 +95,11 @@ run:
   output_dir: "ckpt/qformer_stage3_default_amazon"
   device: "cuda"
   seed: 42
-  # Best-checkpoint / early-stop selection metric: 'auc' (legacy) or 'uauc'.
-  # uAUC is the headline vs SeLLa-Rec, and AUC/uAUC are decoupled on this split,
-  # so select on uAUC to save the uAUC-best checkpoint.
+  # Best-checkpoint / early-stop selection metric: 'auc' (legacy), 'uauc', or a
+  # composite like 'auc+uauc' (mean of both — selects the checkpoint that treats
+  # the pair equally, the way CoLLM/SeLLa-Rec REPORT them). uAUC is the headline
+  # vs SeLLa-Rec, and AUC/uAUC are decoupled on this split, so we select on uAUC
+  # to save the uAUC-best checkpoint; both metrics are always logged regardless.
   best_metric: uauc
   # SeLLa-Rec uAUC protocol: average uAUC only over users with >N interactions
   # (counted from the train split). 0 = off (uAUC over all eligible users).
@@ -113,12 +115,21 @@ run:
     embedding_size: ${model.rec_config.embedding_size}
     epoch: 5000
     eval_epoch: 5    # train-AUC is computed over all 727k rows each eval; every-epoch is wasteful
-    patience: 100
+    # MF converges by ~epoch 80 on this split and each eval cycle costs ~20s
+    # (predictions over train+valid+test + per-user AUC); patience 100 evals
+    # kept it grinding for hundreds of useless epochs. Improvement gaps
+    # observed in the log were <=11 evals, so 25 is a safe margin.
+    patience: 25
     batch_size: 1024
   qformer_stage1:
     seed: 2025
-    batch_size: 256
-    num_workers: 4
+    # Throughput on A100-80GB: stage 1 was fp32 @ batch 256 -> ~14GB used, GPU
+    # mostly idle. 4x batch + bf16 autocast (amp_bf16) saturate it far better.
+    # Larger batches also give the ITC/ITM contrastives more in-batch
+    # negatives (mildly different objective, typically better).
+    batch_size: 1024
+    num_workers: 8
+    amp_bf16: True
     embedding_size: ${model.rec_config.embedding_size}
     user_num: ${model.rec_config.user_num}
     item_num: ${model.rec_config.item_num}
@@ -142,7 +153,9 @@ run:
     # so ITC/ITM/ITG fire with enough in-batch negatives (fixes the starvation
     # noted above). Applies to the train loader only.
     balanced_batches: True
-    min_item_text_per_batch: 64
+    # Scaled with batch_size (was 64 @ batch 256) to keep the same ~25%
+    # item-text fraction per batch.
+    min_item_text_per_batch: 256
     lr: 5e-5
     w_itc: 1.0
     w_itm: 1.0

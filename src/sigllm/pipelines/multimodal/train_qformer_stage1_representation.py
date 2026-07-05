@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import random
 import torch
 from torch.optim import Adam
@@ -123,6 +124,20 @@ def _move_batch_to_device(batch, device):
     return batch
 
 
+def _autocast_ctx(dtype):
+    """bf16 autocast context for the loss computation (None = fp32 as before).
+
+    Stage 1 historically ran pure fp32, which leaves an A100 mostly idle
+    (~14GB used, low utilization). bf16 autocast on Ampere+ is numerically
+    safe for these contrastive/LM losses (cross_entropy stays fp32 under
+    autocast policy) and roughly 2-3x faster. Backward/optimizer run outside
+    the context on fp32 master weights.
+    """
+    if dtype is None:
+        return contextlib.nullcontext()
+    return torch.autocast("cuda", dtype=dtype)
+
+
 def _subset_batch(batch, indices):
     index_list = indices.detach().cpu().tolist()
     out = {}
@@ -235,6 +250,7 @@ def evaluate_loss(
     tau_ii=0.07,
     tau_ui=0.07,
     itm_num_neg=1,
+    autocast_dtype=None,
 ):
     model.eval()
     device = next(model.parameters()).device
@@ -256,19 +272,20 @@ def evaluate_loss(
     with torch.no_grad():
         for batch in loader:
             batch = _move_batch_to_device(batch, device)
-            loss, logs = train_step(
-                batch,
-                model,
-                w_itc=w_itc,
-                w_itm=w_itm,
-                w_itg=w_itg,
-                w_ii=w_ii,
-                w_ui=w_ui,
-                tau_itc=tau_itc,
-                tau_ii=tau_ii,
-                tau_ui=tau_ui,
-                itm_num_neg=itm_num_neg,
-            )
+            with _autocast_ctx(autocast_dtype):
+                loss, logs = train_step(
+                    batch,
+                    model,
+                    w_itc=w_itc,
+                    w_itm=w_itm,
+                    w_itg=w_itg,
+                    w_ii=w_ii,
+                    w_ui=w_ui,
+                    tau_itc=tau_itc,
+                    tau_ii=tau_ii,
+                    tau_ui=tau_ui,
+                    itm_num_neg=itm_num_neg,
+                )
             totals["loss"] += loss.item()
             for key in logs:
                 totals[key] += logs[key].item()
@@ -333,6 +350,15 @@ def train_qformer_stage1_representation(cfg):
     tau_ui = float(cfg.get("tau_ui", 0.07))
     itm_num_neg = int(cfg.get("itm_num_neg", 1))  # CHANGE 2e
 
+    # bf16 autocast (opt-in via qformer_stage1.amp_bf16) — Ampere+ only.
+    amp_dtype = None
+    if bool(cfg.get("amp_bf16", False)):
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            amp_dtype = torch.bfloat16
+            log_step("AMP", "bf16 autocast enabled for stage-1 train/eval")
+        else:
+            log_step("AMP", "amp_bf16 requested but bf16 unsupported here; staying fp32")
+
     # Per-step progress so long epochs aren't silent (metrics still log per epoch).
     log_every = int(cfg.get("log_every_n_steps", 50))
     total_batches = len(train_loader) if hasattr(train_loader, "__len__") else None
@@ -362,20 +388,21 @@ def train_qformer_stage1_representation(cfg):
             batch = _move_batch_to_device(batch, device)
             opt.zero_grad()
 
-            loss, logs = train_step(
-                batch,
-                model,
-                w_itc=cfg.w_itc,
-                w_itm=cfg.w_itm,
-                w_itg=cfg.w_itg,
-                w_ii=cfg.w_ii,
-                w_ui=w_ui,
-                tau_itc=cfg.tau_itc,
-                tau_ii=cfg.tau_ii,
-                tau_ui=tau_ui,
-                itm_num_neg=itm_num_neg,
-                debug_batch=cfg.debug_batch and epoch == 0 and train_steps < cfg.debug_batch_max_steps,
-            )
+            with _autocast_ctx(amp_dtype):
+                loss, logs = train_step(
+                    batch,
+                    model,
+                    w_itc=cfg.w_itc,
+                    w_itm=cfg.w_itm,
+                    w_itg=cfg.w_itg,
+                    w_ii=cfg.w_ii,
+                    w_ui=w_ui,
+                    tau_itc=cfg.tau_itc,
+                    tau_ii=cfg.tau_ii,
+                    tau_ui=tau_ui,
+                    itm_num_neg=itm_num_neg,
+                    debug_batch=cfg.debug_batch and epoch == 0 and train_steps < cfg.debug_batch_max_steps,
+                )
             loss.backward()
             opt.step()
 
@@ -408,6 +435,7 @@ def train_qformer_stage1_representation(cfg):
                 tau_ii=cfg.tau_ii,
                 tau_ui=tau_ui,
                 itm_num_neg=itm_num_neg,
+                autocast_dtype=amp_dtype,
             )
             print(
                 f"epoch {epoch+1} | "
@@ -489,6 +517,7 @@ def train_qformer_stage1_representation(cfg):
         tau_itc=cfg.tau_itc,
         tau_ii=cfg.tau_ii,
         itm_num_neg=itm_num_neg,
+        autocast_dtype=amp_dtype,
     )
     log_step(
         "Test results",

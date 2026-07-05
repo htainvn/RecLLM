@@ -224,9 +224,16 @@ class RecBaseTask:
             )
             
             # Metric that drives best-checkpoint selection / early stop (higher=better).
-            # Default 'auc' (legacy); set run.best_metric='uauc' to optimize per-user AUC.
+            # Default 'auc' (legacy); 'uauc' optimizes per-user AUC. A composite like
+            # 'auc+uauc' selects on the unweighted MEAN of the named metrics (treat
+            # them as an equal pair, the way CoLLM/SeLLa-Rec report them).
             best_metric = getattr(self, "_best_metric", "auc")
-            agg = metrics.get(best_metric)
+            if "+" in best_metric:
+                parts = [p.strip() for p in best_metric.split("+") if p.strip()]
+                vals = [metrics.get(p) for p in parts]
+                agg = sum(vals) / len(vals) if vals and all(v is not None for v in vals) else None
+            else:
+                agg = metrics.get(best_metric)
             if agg is None:
                 agg = -metric_logger.meters['loss'].global_avg
             all_results = {
