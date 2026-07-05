@@ -54,9 +54,30 @@ def apply_step2_overrides(cfg, slug):
     cfg.model_cfg.prompt_path = step2.prompt_path
     step1_out = cfg.run_cfg.qformer_stage3_step1.output_dir
     best_name = cfg.run_cfg.qformer_stage3_step1.best_ckpt_name
-    cfg.model_cfg.ckpt = os.path.join(step1_out, slug, best_name)
+    step1_ckpt = os.path.join(step1_out, slug, best_name)
+    if cfg.run_cfg.get("evaluate", False):
+        # Eval-only: _save_checkpoint strips frozen params, so the step-1 ckpt
+        # holds ONLY LoRA and the step-2 ckpt holds ONLY Q-Former/projection.
+        # Load BOTH, step-1 first. A user-supplied model.ckpt names the step-2
+        # weights (previously it was silently overwritten with the step-1 path,
+        # so eval never saw the CIE-trained Q-Former); default to this run's
+        # best checkpoint under <step2.output_dir>/<slug>/.
+        user_ckpt = cfg.model_cfg.get("ckpt")
+        if user_ckpt and not isinstance(user_ckpt, str):
+            # Explicit list: the caller controls the full load order.
+            cfg.model_cfg.ckpt = user_ckpt
+        else:
+            step2_ckpt = user_ckpt or os.path.join(
+                step2.output_dir, slug, "checkpoint_best.pth"
+            )
+            cfg.model_cfg.ckpt = [step1_ckpt, step2_ckpt]
+    else:
+        cfg.model_cfg.ckpt = step1_ckpt
     cfg.run_cfg.output_dir = step2.output_dir
     cfg.run_cfg.init_lr = step2.init_lr
+    # Honor a step-2 min_lr so the cosine schedule is not inverted by the global
+    # run.min_lr (8e-5 > the 3e-5 step-2 init_lr, which made the LR RISE).
+    cfg.run_cfg.min_lr = step2.get("min_lr", cfg.run_cfg.min_lr)
     cfg.run_cfg.max_epoch = step2.max_epoch
 
 

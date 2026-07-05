@@ -1049,14 +1049,31 @@ class QRecLLM(Rec2Base):
             cora_target_modules=cora_target_modules,
         )
 
-        ckpt_path = cfg.get("ckpt", "")
-        if ckpt_path:
+        # `ckpt` may be a single path or a LIST of paths loaded in order. The list
+        # form is required for evaluating Stage 3: the runner's _save_checkpoint
+        # strips frozen params, so the step-1 ckpt holds ONLY LoRA and the step-2
+        # ckpt holds ONLY Q-Former/projection — neither alone reconstructs the
+        # trained model.
+        ckpt_paths = cfg.get("ckpt", "") or []
+        if isinstance(ckpt_paths, str):
+            ckpt_paths = [ckpt_paths]
+        for ckpt_path in ckpt_paths:
             log_step("Load QRecLLM Checkpoint: {}".format(ckpt_path))
             ckpt = torch.load(ckpt_path, map_location="cpu")
             msg = model.load_state_dict(ckpt['model'], strict=False)
-            log_step("loading message, msg.... {}".format(msg))
-            if os.path.exists(rec_config['pretrained_path']) and freeze_rec:
-                model.rec_encoder.load_state_dict(torch.load(rec_config['pretrained_path'], map_location="cpu"))
+            # Only report COUNTS + any unexpected keys. The full missing_keys list is
+            # just the frozen base LLM/MF weights (loaded separately) -- printing it in
+            # full floods the log and buries the eval metrics.
+            log_step(
+                "loading message",
+                "missing={} (frozen base/MF, expected), unexpected={} -> {}".format(
+                    len(msg.missing_keys),
+                    len(msg.unexpected_keys),
+                    list(msg.unexpected_keys)[:20] if msg.unexpected_keys else "none",
+                ),
+            )
+        if ckpt_paths and os.path.exists(rec_config['pretrained_path']) and freeze_rec:
+            model.rec_encoder.load_state_dict(torch.load(rec_config['pretrained_path'], map_location="cpu"))
 
         ans_type = cfg.get('ans_type')
         model.set_answer_type(mode=ans_type)

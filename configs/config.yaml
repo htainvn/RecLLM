@@ -241,6 +241,9 @@ run:
     output_dir: "/content/SigLLM/ckpt/qformer_stage3_step2_cie_qwen2/"
     ckpt: "${run.qformer_stage3_step1.output_dir}${run.qformer_stage3_step1.best_ckpt_name}"
     init_lr: 3e-5
+    # Must stay below init_lr: the global run.min_lr (8e-5) is ABOVE 3e-5, which
+    # inverted the cosine schedule (LR rose from 3e-5 to 8e-5 during training).
+    min_lr: 5e-6
     max_epoch: 200
 
   # Optimization
