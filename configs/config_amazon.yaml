@@ -15,6 +15,20 @@ model:
   # measure the Q-Former's marginal value vs the plain-text prompt.
   ablate_soft_tokens: False
 
+  # CHANGE Q1/Q2/Q3 (Run B): flags below turn on the Q-Former improvements in
+  # one combined run; each is independently revertible for bisection.
+  # Domain noun for per-sample Q-Former instructions ("movie" for ML-1M).
+  item_noun: "book"
+  # CHANGE Q2: auxiliary direct-rank BCE on mean-pooled Q-Former queries in
+  # step 2. Also surfaces qformer_AUC/qformer_uAUC at eval (standalone bridge
+  # quality vs the MF baseline 0.5366). 0 = off.
+  rank_aux_weight: 0.3
+  # CHANGE Q3: with this probability a training batch uses a title-free prompt,
+  # forcing the Yes/No loss through the <CFTokens> channel. Eval always uses
+  # the titled prompt. 0 = off.
+  prompt_path_notitle: "/content/SigLLM/prompts/qformer_prompt_book_mt_notitle.txt"
+  title_free_ratio: 0.3
+
   tuning_step: null
 
   lora_config:
@@ -43,6 +57,11 @@ model:
 
   qformer_config:
     use_qformer: True
+    # CHANGE Q1: "target_title" builds one instruction per sample from the
+    # target book's title (same sentence shape as the Stage-1 rich item text),
+    # so the text branch finally carries per-sample signal. "static" = legacy
+    # fixed templates.
+    instruction_mode: "target_title"
     qformer_ckpt: "${run.qformer_stage2.output_dir}${run.qformer_stage2.qformer_ckpt_out}"
     llm_proj_ckpt: "${run.qformer_stage2.output_dir}${run.qformer_stage2.proj_ckpt_out}"
     qformer_d_model: 768
@@ -208,7 +227,8 @@ run:
   # CHANGE 2i: extra LR for the Q-Former/projection bridge (lr = init_lr * mult,
   # honored across warmup+cosine). 1.0 = off. Raise (e.g. 3-5) to push more
   # gradient/step into the bridge under the frozen LLM; sweep and watch val uAUC.
-  qformer_lr_mult: 1.0
+  # Run B: set to 3.0 (also covers the rank head, which rides the bridge group).
+  qformer_lr_mult: 3.0
 
   max_epoch: 200
   iters_per_epoch: 400

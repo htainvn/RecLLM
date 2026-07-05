@@ -7,8 +7,15 @@ def _is_qformer_bridge_param(name: str) -> bool:
 
     These are the only trainable modules in CoLLM Step 2, and the gradient that
     reaches them through the frozen LLM (from a 1-bit Yes/No loss) is weak.
+    The rank head (CHANGE Q2) rides with the bridge: it is trained by the same
+    auxiliary loss and should follow the same lr multiplier.
     """
-    return name.startswith("qformer.") or "llm_proj" in name or "cf_injector" in name
+    return (
+        name.startswith("qformer.")
+        or "llm_proj" in name
+        or "cf_injector" in name
+        or "rank_head" in name
+    )
 
 
 def build_optimizer(model, config):

@@ -114,6 +114,11 @@ class QRecLLM(Rec2Base):
         cf_injection_mode="soft_token",
         cora_alpha=16.0,
         cora_target_modules=("q_proj", "v_proj"),
+        qformer_instruction_mode="static",
+        item_noun="movie",
+        rank_aux_weight=0.0,
+        prompt_path_notitle="",
+        title_free_ratio=0.0,
     ):
         super().__init__()
 
@@ -152,6 +157,20 @@ class QRecLLM(Rec2Base):
         self.cora_target_modules = tuple(cora_target_modules)
         self.cf_injector = None
 
+        # CHANGE Q1: per-sample Q-Former conditioning. "static" reproduces the
+        # legacy fixed templates; "target_title" builds one instruction per row
+        # from the target item's title, in the same "<title> is a <noun>.
+        # Represent this <noun> for recommendation." shape as the Stage-1 rich
+        # item text — so the text branch sees a familiar distribution while the
+        # queries can compute title x CF interaction features.
+        self.qformer_instruction_mode = str(qformer_instruction_mode or "static").lower()
+        if self.qformer_instruction_mode not in ("static", "target_title"):
+            raise ValueError(
+                f"qformer_instruction_mode must be static|target_title; "
+                f"got '{self.qformer_instruction_mode}'"
+            )
+        self.item_noun = str(item_noun or "movie")
+
         log_step("Running MiniGPT4Rec_v2 initialization")
 
         self.rec_model_type = rec_model
@@ -172,7 +191,12 @@ class QRecLLM(Rec2Base):
             max_instruction_length=max_instruction_length,
         )
         self._init_projection(proj_token_num, freeze_proj, pretrained_llm_proj)
-        self._init_prompts(prompt_path, prompt_template, max_txt_len, end_sym)
+        self._init_rank_head(rank_aux_weight)
+        self._init_prompts(
+            prompt_path, prompt_template, max_txt_len, end_sym,
+            prompt_path_notitle=prompt_path_notitle,
+            title_free_ratio=title_free_ratio,
+        )
         self._init_cf_injection()
         self._apply_tuning_step_policy()
 
@@ -347,9 +371,12 @@ class QRecLLM(Rec2Base):
                     p.requires_grad = False
                 self.cf_injector.eval()
                 self.cf_injector.train = disabled_train
+            for p in self.rank_head.parameters():
+                p.requires_grad = False
+            self.rank_head.eval()
             log_step(
                 "Tuning step 1",
-                "LoRA trainable; Q-Former, projection, CF-injector, MF and base LLM all frozen.",
+                "LoRA trainable; Q-Former, projection, rank head, CF-injector, MF and base LLM all frozen.",
             )
 
         elif int(step) == 2:
@@ -374,9 +401,14 @@ class QRecLLM(Rec2Base):
                 for p in self.cf_injector.parameters():
                     p.requires_grad = True
                 self.cf_injector.train()
+            if self.rank_aux_weight > 0:
+                for p in self.rank_head.parameters():
+                    p.requires_grad = True
+                self.rank_head.train()
             log_step(
                 "Tuning step 2",
-                "Q-Former + projection + CF-injector trainable; LoRA, base LLM and MF frozen.",
+                "Q-Former + projection + CF-injector (+ rank head if aux on) trainable; "
+                "LoRA, base LLM and MF frozen.",
             )
 
         else:
@@ -507,6 +539,33 @@ class QRecLLM(Rec2Base):
         log_step("Loading Projection Done",
                 f"d_q={d_q}, H={H}, Q={self.proj_token_num}")
 
+    def _init_rank_head(self, rank_aux_weight):
+        """CHANGE Q2: direct ranking head on the Q-Former output.
+
+        Scores mean-pooled queries -> label with a small MLP, trained as an
+        auxiliary BCE loss (weight ``rank_aux_weight``) alongside the LLM loss
+        in Stage-3 step 2. Two purposes: (a) a standalone Q-Former uAUC that
+        proves the bridge extracts ranking signal beyond MF's dot product;
+        (b) a strong direct gradient into the Q-Former that does not have to
+        squeeze through the frozen LLM. ``rank_aux_weight=0`` disables it
+        (head is created but frozen, so checkpoints stay compatible).
+        """
+        self.rank_aux_weight = float(rank_aux_weight)
+        d_q = int(self.qformer.output_dim)
+        self.rank_head = nn.Sequential(
+            nn.Linear(d_q, d_q // 2),
+            nn.GELU(),
+            nn.Linear(d_q // 2, 1),
+        ).to(self.device)
+        if self.rank_aux_weight <= 0:
+            for p in self.rank_head.parameters():
+                p.requires_grad = False
+        log_step(
+            "Rank aux head",
+            f"weight={self.rank_aux_weight}, d_q={d_q}, "
+            f"trainable={self.rank_aux_weight > 0}",
+        )
+
     def _log_trainable_module_stats(self):
         if self._has_logged_trainable_stats:
             return
@@ -547,27 +606,54 @@ class QRecLLM(Rec2Base):
         )
         self._flow_log_steps += 1
 
-    def _init_prompts(self, prompt_path, prompt_template, max_txt_len, end_sym):
+    @staticmethod
+    def _read_prompt_file(prompt_path, prompt_template):
+        with open(prompt_path, 'r') as f:
+            raw_prompts = f.read().splitlines()
+        # TEMP_DISABLED_USER_CF: keep old prompts in the file with this marker,
+        # but do not sample them while user CF is disabled.
+        filted_prompts = [
+            raw_prompt for raw_prompt in raw_prompts
+            if raw_prompt.strip() and not raw_prompt.lstrip().startswith("# DISABLED_USER_CF")
+        ]
+        return [prompt_template.format(p) for p in filted_prompts]
+
+    def _init_prompts(self, prompt_path, prompt_template, max_txt_len, end_sym,
+                      prompt_path_notitle="", title_free_ratio=0.0):
         self.max_txt_len = max_txt_len
         self.end_sym = end_sym
         self.has_print_prompt = False
 
         if prompt_path:
-            with open(prompt_path, 'r') as f:
-                raw_prompts = f.read().splitlines()
-            # TEMP_DISABLED_USER_CF: keep old prompts in the file with this marker,
-            # but do not sample them while user CF is disabled.
-            filted_prompts = [
-                raw_prompt for raw_prompt in raw_prompts
-                if raw_prompt.strip() and not raw_prompt.lstrip().startswith("# DISABLED_USER_CF")
-            ]
-            self.prompt_list = [prompt_template.format(p) for p in filted_prompts]
+            self.prompt_list = self._read_prompt_file(prompt_path, prompt_template)
             log_step(f"Load {len(self.prompt_list)} training prompts")
             log_step(f"Prompt List: \n{self.prompt_list}")
         else:
             self.prompt_list = []
 
+        # CHANGE Q3: title-free prompt mixing. With probability
+        # ``title_free_ratio`` a TRAINING batch uses a prompt without
+        # <ItemTitleList>/<TargetItemTitle>, so the Yes/No loss must route
+        # through the <CFTokens> soft tokens — keeping the CF channel's
+        # gradient alive next to the much stronger title pathway. Evaluation
+        # always uses prompt_list[0] (titled), so headline metrics are
+        # unaffected and the same checkpoint can additionally be evaluated
+        # title-free.
+        self.title_free_ratio = float(title_free_ratio)
+        self.prompt_list_notitle = []
+        if prompt_path_notitle and self.title_free_ratio > 0:
+            self.prompt_list_notitle = self._read_prompt_file(
+                prompt_path_notitle, prompt_template
+            )
+            log_step(
+                "Title-free prompt mixing ON",
+                f"ratio={self.title_free_ratio}, "
+                f"{len(self.prompt_list_notitle)} title-free prompts",
+            )
+
     def _sample_prompt(self):
+        if self.prompt_list_notitle and random.random() < self.title_free_ratio:
+            return random.choice(self.prompt_list_notitle)
         return random.choices(
             self.prompt_list,
             weights=[5] * (len(self.prompt_list) - 1) + [1],
@@ -653,7 +739,7 @@ class QRecLLM(Rec2Base):
         if instruction_list is None:
             instruction_list = batch_data.get(
                 "instruction",
-                self._build_qformer_instructions(B),
+                self._build_qformer_instructions(batch_data),
             )
         if isinstance(instruction_list, str):
             ins_list = [instruction_list] * B
@@ -681,6 +767,13 @@ class QRecLLM(Rec2Base):
             if self.ablate_soft_tokens:
                 cf_llm = torch.zeros_like(cf_llm)
 
+            # CHANGE Q2: direct ranking logit from the mean-pooled queries.
+            # Kept in fp32 for the BCE; the standalone score is also surfaced
+            # at eval so the Q-Former's own uAUC is measured for free.
+            aux_logit = None
+            if self.rank_aux_weight > 0:
+                aux_logit = self.rank_head(cf_q.mean(dim=1)).squeeze(-1).float()
+
             merged_flat = None
             if feature_order and "<CFTokens>" in feature_order:
                 merged_flat = cf_llm.reshape(B * Q, H)
@@ -688,6 +781,7 @@ class QRecLLM(Rec2Base):
             rec_embeds = {
                 "CF_emb": cf_llm,            # [B, Q, H]
                 "merged_embs": merged_flat,  # [B*Q, H] or None
+                "aux_logit": aux_logit,      # [B] or None
             }
             self._log_information_flow(None, cf_q, None, cf_llm, merged_flat)
 
@@ -864,13 +958,36 @@ class QRecLLM(Rec2Base):
 
         return label_embeds, label_tokens, ans_map
 
-    def _build_qformer_instructions(self, batch_size: int) -> list:
-        """Build short item-text instructions for the Q-Former.
+    def _build_qformer_instructions(self, batch_data) -> list:
+        """Build the Q-Former's text-branch input, one string per row.
 
-        Matches the distribution the Q-Former was trained on in stage 1: a
-        fresh sample per row during training, a deterministic fixed string
-        during eval/inference so the same input maps to the same embedding.
+        "static" (legacy): fixed templates — a fresh sample per row during
+        training, a deterministic fixed string during eval/inference. The
+        instruction then carries ZERO per-sample information.
+
+        "target_title" (CHANGE Q1): condition on the target item's title in
+        the same sentence shape as the Stage-1 rich item text
+        (``"<title> is a <noun>. Represent this <noun> for
+        recommendation."``), so the queries can compute per-sample
+        title x CF interaction features. Deterministic in both training and
+        eval — the per-sample variation comes from the title itself.
         """
+        batch_size = batch_data["UserID"].shape[0]
+
+        if (
+            self.qformer_instruction_mode == "target_title"
+            and "TargetItemTitle" in batch_data
+        ):
+            noun = self.item_noun
+            instructions = []
+            for raw_title in batch_data["TargetItemTitle"]:
+                # Dataset wraps titles in quotes; strip for a natural sentence.
+                title = str(raw_title).strip().strip('"').strip()
+                instructions.append(
+                    f"{title} is a {noun}. Represent this {noun} for recommendation."
+                )
+            return instructions
+
         if self.training:
             return random.choices(self.QFORMER_ITEM_INSTRUCTIONS, k=batch_size)
         return [self.QFORMER_ITEM_INSTRUCTIONS[0]] * batch_size
@@ -884,15 +1001,20 @@ class QRecLLM(Rec2Base):
             rec_embeds = {
                 "CF_emb": None,
                 "merged_embs": None,
+                "aux_logit": None,
             }
             rec_atts = None
         else:
-            instruction_list = self._build_qformer_instructions(batch_size)
+            instruction_list = self._build_qformer_instructions(batch_data)
             rec_embeds, rec_atts = self.encode_rec_features_to_llm_v2(
                 batch_data,
                 feature_order=feature_order or [],
                 instruction_list=instruction_list,
             )
+
+        # CHANGE Q2: stash the ranking logit for the caller (forward_v2 adds
+        # the aux loss; generate_for_samples surfaces the standalone score).
+        self._last_aux_logit = rec_embeds.get("aux_logit")
 
         llm_embeds, llm_atts = self.wrap_prompt_with_soft_tokens_v2(rec_embeds, rec_atts, batch_data, prompt_template)
         return llm_embeds, llm_atts
@@ -918,7 +1040,13 @@ class QRecLLM(Rec2Base):
         if return_all:
             return outputs, logits
 
-        return {"loss": loss, "logits": logits}
+        result = {"loss": loss, "logits": logits}
+        # CHANGE Q2: surface the Q-Former's standalone score so the task can
+        # report a qformer-only AUC/uAUC next to the LLM metrics.
+        aux_logit = getattr(self, "_last_aux_logit", None)
+        if aux_logit is not None:
+            result["aux_logits"] = torch.sigmoid(aux_logit)
+        return result
 
     def _maybe_log_predictions(self, samples, prob_yes, ans_map, samples_per_batch=3):
         """Emit a compact per-sample log of (UserID, TargetItemID, label,
@@ -968,9 +1096,20 @@ class QRecLLM(Rec2Base):
         )
         
         targets = self.prepare_llm_targets(input_atts, label_tokens)
-        
+
         outputs = self.execute_llm_forward(full_embeds, full_atts, targets)
         loss = self.calculate_recommendation_loss(outputs, label_tokens, batch_data, ans_map)
+
+        # CHANGE Q2: auxiliary direct-rank loss on the Q-Former queries. Gives
+        # the bridge a strong gradient that does not pass through the frozen
+        # LLM, and trains the head whose eval-time score is the Q-Former's
+        # standalone uAUC.
+        aux_logit = getattr(self, "_last_aux_logit", None)
+        if aux_logit is not None and self.rank_aux_weight > 0:
+            aux_loss = nn.functional.binary_cross_entropy_with_logits(
+                aux_logit, batch_data["label"].float()
+            )
+            loss = loss + self.rank_aux_weight * aux_loss
 
         return {"loss": loss}
 
@@ -1016,6 +1155,12 @@ class QRecLLM(Rec2Base):
         cora_alpha = float(cfg.get("cora_alpha", 16.0))
         cora_target_modules = cfg.get("cora_target_modules", lora_target_modules)
 
+        qformer_instruction_mode = qformer_config.get("instruction_mode", "static")
+        item_noun = cfg.get("item_noun", "movie")
+        rank_aux_weight = float(cfg.get("rank_aux_weight", 0.0))
+        prompt_path_notitle = cfg.get("prompt_path_notitle", "")
+        title_free_ratio = float(cfg.get("title_free_ratio", 0.0))
+
         model = cls(
             rec_model=rec_model,
             rec_config=rec_config,
@@ -1047,6 +1192,11 @@ class QRecLLM(Rec2Base):
             cf_injection_mode=cf_injection_mode,
             cora_alpha=cora_alpha,
             cora_target_modules=cora_target_modules,
+            qformer_instruction_mode=qformer_instruction_mode,
+            item_noun=item_noun,
+            rank_aux_weight=rank_aux_weight,
+            prompt_path_notitle=prompt_path_notitle,
+            title_free_ratio=title_free_ratio,
         )
 
         # `ckpt` may be a single path or a LIST of paths loaded in order. The list

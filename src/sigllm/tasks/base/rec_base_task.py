@@ -203,6 +203,15 @@ class RecBaseTask:
                     f"pred_pos_rate@0.5={metrics.get('pred_pos_rate', 0):.4f}"
                 ),
             )
+            if metrics.get('qformer_uauc', 0):
+                log_step(
+                    "Q-Former standalone (rank aux head)",
+                    (
+                        f"qformer_AUC={metrics.get('qformer_auc', 0):.6f}, "
+                        f"qformer_uAUC={metrics.get('qformer_uauc', 0):.6f} "
+                        f"(vs MF baseline and LLM uAUC above)"
+                    ),
+                )
             log_step(
                 "Score separation",
                 (
@@ -226,6 +235,8 @@ class RecBaseTask:
             'acc': val_acc,
             'loss': val_loss,
             'uauc': metrics.get('uauc', 0),
+            'qformer_auc': metrics.get('qformer_auc', 0),
+            'qformer_uauc': metrics.get('qformer_uauc', 0),
             'pos_rate': metrics.get('pos_rate', 0),
             'pred_pos_rate': metrics.get('pred_pos_rate', 0),
             'pos_score_mean': metrics.get('pos_score_mean', 0),
@@ -238,23 +249,27 @@ class RecBaseTask:
         return all_results
 
     def _collect_predictions(self, model, data_loader, logger, header, cuda_enabled):
-        results = {'logits': [], 'labels': [], 'users': []}
-        
+        results = {'logits': [], 'labels': [], 'users': [], 'aux': []}
+
         for samples in logger.log_every(data_loader, 10, header):
             if cuda_enabled:
                 samples = move_to_cuda(samples, cuda_enabled=cuda_enabled)
             eval_output = self.valid_step(model=model, samples=samples)
-            
+
             logger.update(loss=eval_output['loss'].item())
 
             if 'logits' in eval_output:
                 logits = eval_output['logits']
                 labels = samples['label']
-                
+
                 results['logits'].append(logits.detach())
                 results['labels'].append(labels.detach())
                 results['users'].append(samples['UserID'].detach())
-                
+
+                # CHANGE Q2: Q-Former standalone scores from the rank aux head.
+                if 'aux_logits' in eval_output:
+                    results['aux'].append(eval_output['aux_logits'].detach())
+
                 acc = ((logits > 0.5).float() == labels).float().mean()
                 logger.update(acc=acc.item())
                 
@@ -267,9 +282,12 @@ class RecBaseTask:
         if data['logits'] is None:
             return data
         if not is_dist_avail_and_initialized():
-            return {k: v.cpu().numpy() for k, v in data.items()}
+            return {k: v.cpu().numpy() if v is not None else None for k, v in data.items()}
         gathered = {}
         for key, tensor in data.items():
+            if tensor is None:
+                gathered[key] = None
+                continue
             world_size = dist.get_world_size()
             tensor_list = [torch.zeros_like(tensor) for _ in range(world_size)]
             dist.all_gather(tensor_list, tensor)
@@ -293,9 +311,25 @@ class RecBaseTask:
 
         pos_score_mean = float(scores[pos_mask].mean()) if pos_mask.any() else 0.0
         neg_score_mean = float(scores[neg_mask].mean()) if neg_mask.any() else 0.0
+
+        # CHANGE Q2: Q-Former standalone metrics from the rank aux head. This
+        # is the direct evidence of how much ranking signal the bridge itself
+        # extracts (compare against the MF baseline and the LLM uauc above).
+        qf_auc, qf_uauc = 0.0, 0.0
+        if data.get('aux') is not None:
+            aux_scores = np.asarray(data['aux']).astype(np.float32)
+            qf_auc = roc_auc_score(labels, aux_scores)
+            qf_uauc, _, _ = calculate_user_auc(
+                data['users'], aux_scores, labels,
+                interaction_counts=getattr(self, "_uauc_counts", None),
+                min_interactions=getattr(self, "_uauc_min_interactions", 0),
+            )
+
         return {
             'auc': auc,
             'uauc': uauc,
+            'qformer_auc': qf_auc,
+            'qformer_uauc': qf_uauc,
             'pos_rate': float(labels.mean()) if labels.size else 0.0,
             'pred_pos_rate': float((scores > 0.5).mean()) if scores.size else 0.0,
             'pos_score_mean': pos_score_mean,
