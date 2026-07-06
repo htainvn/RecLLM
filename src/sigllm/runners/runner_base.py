@@ -237,8 +237,14 @@ class RunnerBase:
                     # torch.cuda.empty_cache()
                 
                         
-                # evaluation phase
-                if len(self.valid_splits) > 0:
+                # evaluation phase. run.valid_freq=N evaluates every N epochs
+                # (default 1). With a 7B LLM the full-valid eval can cost 2-3x
+                # the training epoch itself, so N=2 nearly halves wall-clock.
+                # NOTE: the early-stop counter ticks per EVAL, so patience
+                # covers valid_freq * 20 epochs.
+                valid_freq = max(int(self.config.run_cfg.get("valid_freq", 1)), 1)
+                run_valid = len(self.valid_splits) > 0 and (cur_epoch + 1) % valid_freq == 0
+                if run_valid:
                     for split_name in self.valid_splits:
                         logging.info("Evaluating on {}.".format(split_name))
 
@@ -272,7 +278,7 @@ class RunnerBase:
                                 #     break
                         # torch.cuda.empty_cache()
 
-                else:
+                elif len(self.valid_splits) == 0:
                     # if no validation split is provided, we just save the checkpoint at the end of each epoch.
                     if not self.evaluate_only:
                         self._save_checkpoint(cur_epoch, is_best=False)

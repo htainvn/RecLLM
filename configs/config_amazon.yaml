@@ -245,6 +245,11 @@ run:
 
   max_epoch: 200
   iters_per_epoch: 400
+  # Evaluate valid every N epochs. The full-valid eval (~9.5 min with the 7B
+  # LLM) costs ~2.4x the 400-iter training epoch (~4 min), so N=2 cuts stage-3
+  # wall-clock by ~40%. Early-stop patience counts EVALS (20), so coverage is
+  # valid_freq*20 epochs.
+  valid_freq: 2
   batch_size_train: 16
   batch_size_eval: 64
   num_workers: 4

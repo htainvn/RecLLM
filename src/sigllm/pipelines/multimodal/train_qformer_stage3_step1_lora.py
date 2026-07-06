@@ -48,6 +48,11 @@ def apply_step1_overrides(cfg):
     step1 = cfg.run_cfg.qformer_stage3_step1
     cfg.model_cfg.tuning_step = 1
     cfg.model_cfg.prompt_path = step1.prompt_path
+    # Step 1 is pure TALLRec (text-only LoRA). The Q3 title-free mixing flag is
+    # a STEP-2 mechanism — left on here it routes ~30% of batches through the
+    # CF-token prompt with a task-naive frozen Q-Former, wasting LoRA training
+    # on a distribution eval never sees.
+    cfg.model_cfg.title_free_ratio = 0.0
     cfg.model_cfg.ckpt = None
     cfg.run_cfg.output_dir = step1.output_dir
     cfg.run_cfg.init_lr = step1.init_lr
