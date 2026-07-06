@@ -256,7 +256,9 @@ run:
   # valid_freq*20 epochs.
   valid_freq: 2
   batch_size_train: 16
-  batch_size_eval: 64
+  # Eval is forward-only; peak train memory is ~55GB of 80GB, so a 2x eval
+  # batch is free and nearly halves the ~9.5-min valid pass.
+  batch_size_eval: 128
   num_workers: 4
   warmup_steps: 200
 

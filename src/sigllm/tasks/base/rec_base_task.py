@@ -279,9 +279,11 @@ class RecBaseTask:
 
                 acc = ((logits > 0.5).float() == labels).float().mean()
                 logger.update(acc=acc.item())
-                
-            torch.cuda.empty_cache()
-            
+
+        # NOTE: this loop used to call torch.cuda.empty_cache() after EVERY
+        # batch — a forced sync + allocator flush that added minutes per eval
+        # pass for no benefit (batch shapes are uniform, the caching allocator
+        # reuses blocks). Removed; peak memory is unchanged.
         return {k: torch.cat(v, dim=0) if v else None for k, v in results.items()}
 
 
