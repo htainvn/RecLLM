@@ -290,8 +290,14 @@ class RunnerBase:
                     dist.barrier()
                 if not self.model_to_be_trained():
                     break
-                if not_change > 20:
-                    logging.info("Early stop. The results has not changed up to 20 epochs.")
+                # Patience counts EVALS (not epochs): tolerance in epochs is
+                # early_stop_patience * valid_freq. Tune together.
+                es_patience = int(self.config.run_cfg.get("early_stop_patience", 20))
+                if not_change > es_patience:
+                    logging.info(
+                        "Early stop. No valid improvement in %d consecutive evals.",
+                        es_patience,
+                    )
                     break
 
         # testing phase, would only run when evaluate_only==True

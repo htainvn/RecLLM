@@ -254,7 +254,11 @@ run:
   # LLM) costs ~2.4x the 400-iter training epoch (~4 min), so N=2 cuts stage-3
   # wall-clock by ~40%. Early-stop patience counts EVALS (20), so coverage is
   # valid_freq*20 epochs.
-  valid_freq: 2
+  valid_freq: 4
+  # 10 stale evals x valid_freq 4 = 40 epochs (256k samples) of tolerance
+  # before giving up -- roughly the same epoch-coverage the old
+  # (patience 20, freq 2) pair had.
+  early_stop_patience: 10
   batch_size_train: 16
   # Eval is forward-only; peak train memory is ~55GB of 80GB, so a 2x eval
   # batch is free and nearly halves the ~9.5-min valid pass.
