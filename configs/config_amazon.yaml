@@ -216,10 +216,15 @@ run:
     init_lr: 2e-4
     # 5 epochs x 400 iters x batch 16 = 32k samples = ~4% of the 727k-row train
     # split -- the LoRA never learned the task (valid uAUC ~0.54 vs TALLRec's
-    # 0.6921 on this split, which is what this step should reach). 40 epochs
-    # (~256k samples) with the runner's 20-stale-epoch early stop; do NOT start
-    # step 2 until step-1 valid uAUC is ~0.65+.
-    max_epoch: 40
+    # 0.6921 on this split, which is what this step should reach).
+    # CoLLM's own tallrec-qwen-book recipe trains up to 800k samples
+    # (100 iters x batch 8 x max_epoch 1000) with early stopping, lr 1e-4
+    # cosine->8e-5 -- the published number comes from LONG adaptive training,
+    # not more capacity (same LoRA r=8 q/v). 120 epochs here = 768k samples
+    # max; the 20-stale-eval early stop ends it when valid uAUC truly stalls.
+    # A larger max_epoch ALSO stretches the cosine so the LR is not already
+    # collapsing at epoch 30. Do NOT start step 2 below valid uAUC ~0.63-0.65.
+    max_epoch: 120
 
   qformer_stage3_step2:
     prompt_path: "/content/SigLLM/prompts/qformer_prompt_book_mt.txt"
