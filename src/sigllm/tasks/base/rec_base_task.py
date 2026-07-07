@@ -198,6 +198,7 @@ class RecBaseTask:
                     f"val_loss={val_loss:.6f}, "
                     f"AUC={metrics.get('auc', 0):.6f}, "
                     f"uAUC={metrics.get('uauc', 0):.6f}, "
+                    f"uAUC_all={metrics.get('uauc_all', 0):.6f}, "
                     f"ACC@0.5={val_acc:.6f}, "
                     f"pos_rate={metrics.get('pos_rate', 0):.4f}, "
                     f"pred_pos_rate@0.5={metrics.get('pred_pos_rate', 0):.4f}"
@@ -317,6 +318,16 @@ class RecBaseTask:
             interaction_counts=getattr(self, "_uauc_counts", None),
             min_interactions=getattr(self, "_uauc_min_interactions", 0),
         )
+        # Unfiltered uAUC (all eligible users). The CoLLM/SeLLa-Rec data is
+        # ALREADY >20-interaction filtered at construction, so the paper
+        # protocol averages over all test users — our extra train-count filter
+        # above is stricter. Report both so the final table is comparable.
+        uauc_all = uauc
+        if getattr(self, "_uauc_min_interactions", 0) > 0:
+            uauc_all, _, _ = calculate_user_auc(
+                data['users'], scores, labels,
+                interaction_counts=None, min_interactions=0,
+            )
 
         pos_score_mean = float(scores[pos_mask].mean()) if pos_mask.any() else 0.0
         neg_score_mean = float(scores[neg_mask].mean()) if neg_mask.any() else 0.0
@@ -337,6 +348,7 @@ class RecBaseTask:
         return {
             'auc': auc,
             'uauc': uauc,
+            'uauc_all': uauc_all,
             'qformer_auc': qf_auc,
             'qformer_uauc': qf_uauc,
             'pos_rate': float(labels.mean()) if labels.size else 0.0,
