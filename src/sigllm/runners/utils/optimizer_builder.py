@@ -15,6 +15,7 @@ def _is_qformer_bridge_param(name: str) -> bool:
         or "llm_proj" in name
         or "cf_injector" in name
         or "rank_head" in name
+        or "target_id_head" in name
     )
 
 

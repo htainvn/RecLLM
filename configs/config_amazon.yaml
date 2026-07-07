@@ -22,7 +22,15 @@ model:
   # CHANGE Q2: auxiliary direct-rank BCE on mean-pooled Q-Former queries in
   # step 2. Also surfaces qformer_AUC/qformer_uAUC at eval (standalone bridge
   # quality vs the MF baseline 0.5366). 0 = off.
-  rank_aux_weight: 0.3
+  # Escalated 0.3 -> 1.0 after the first step-2 run: qformer_uAUC sat ~0.48
+  # while qformer_AUC hit 0.76 (bridge learns user-level signal only).
+  rank_aux_weight: 1.0
+  # CHANGE Q4: in-batch target-identity contrastive on the pooled queries
+  # (identify your OWN target's MF embedding among the batch). Forces target
+  # information through the bridge — without it, nothing in stages 1-3
+  # penalizes dropping the target, so the LLM's uAUC stays pinned at the
+  # title-only level. 0 = off.
+  target_id_aux_weight: 0.5
   # CHANGE Q3: with this probability a training batch uses a title-free prompt,
   # forcing the Yes/No loss through the <CFTokens> channel. Eval always uses
   # the titled prompt. 0 = off.
@@ -246,7 +254,8 @@ run:
   # honored across warmup+cosine). 1.0 = off. Raise (e.g. 3-5) to push more
   # gradient/step into the bridge under the frozen LLM; sweep and watch val uAUC.
   # Run B: set to 3.0 (also covers the rank head, which rides the bridge group).
-  qformer_lr_mult: 3.0
+  # Escalated 3.0 -> 5.0 with the Q4 target-identity aux (step-2 restart arm).
+  qformer_lr_mult: 5.0
 
   max_epoch: 200
   iters_per_epoch: 400

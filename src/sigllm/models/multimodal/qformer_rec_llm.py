@@ -117,6 +117,7 @@ class QRecLLM(Rec2Base):
         qformer_instruction_mode="static",
         item_noun="movie",
         rank_aux_weight=0.0,
+        target_id_aux_weight=0.0,
         prompt_path_notitle="",
         title_free_ratio=0.0,
     ):
@@ -191,7 +192,7 @@ class QRecLLM(Rec2Base):
             max_instruction_length=max_instruction_length,
         )
         self._init_projection(proj_token_num, freeze_proj, pretrained_llm_proj)
-        self._init_rank_head(rank_aux_weight)
+        self._init_rank_head(rank_aux_weight, target_id_aux_weight)
         self._init_prompts(
             prompt_path, prompt_template, max_txt_len, end_sym,
             prompt_path_notitle=prompt_path_notitle,
@@ -374,6 +375,9 @@ class QRecLLM(Rec2Base):
             for p in self.rank_head.parameters():
                 p.requires_grad = False
             self.rank_head.eval()
+            for p in self.target_id_head.parameters():
+                p.requires_grad = False
+            self.target_id_head.eval()
             log_step(
                 "Tuning step 1",
                 "LoRA trainable; Q-Former, projection, rank head, CF-injector, MF and base LLM all frozen.",
@@ -405,6 +409,10 @@ class QRecLLM(Rec2Base):
                 for p in self.rank_head.parameters():
                     p.requires_grad = True
                 self.rank_head.train()
+            if self.target_id_aux_weight > 0:
+                for p in self.target_id_head.parameters():
+                    p.requires_grad = True
+                self.target_id_head.train()
             log_step(
                 "Tuning step 2",
                 "Q-Former + projection + CF-injector (+ rank head if aux on) trainable; "
@@ -539,7 +547,7 @@ class QRecLLM(Rec2Base):
         log_step("Loading Projection Done",
                 f"d_q={d_q}, H={H}, Q={self.proj_token_num}")
 
-    def _init_rank_head(self, rank_aux_weight):
+    def _init_rank_head(self, rank_aux_weight, target_id_aux_weight=0.0):
         """CHANGE Q2: direct ranking head on the Q-Former output.
 
         Scores mean-pooled queries -> label with a small MLP, trained as an
@@ -560,10 +568,27 @@ class QRecLLM(Rec2Base):
         if self.rank_aux_weight <= 0:
             for p in self.rank_head.parameters():
                 p.requires_grad = False
+
+        # CHANGE Q4: target-identity auxiliary. Diagnosis from step-2 logs:
+        # qformer_uAUC sat at ~0.48 (below MF's 0.5366) while qformer_AUC hit
+        # 0.76 — the queries carry user-level signal but DROP target identity
+        # (the target is 1 of 12 cross-attention tokens, and no loss anywhere
+        # in stages 1-3 punishes losing it; that pins the LLM's uAUC at the
+        # title-only level). This head maps mean-pooled queries back to MF item
+        # space; an in-batch contrastive (identify your OWN target among the
+        # batch) forces target information through the bridge. Training only.
+        self.target_id_aux_weight = float(target_id_aux_weight)
+        d_cf = int(self.qformer.d_cf)
+        self.target_id_head = nn.Linear(d_q, d_cf)
+        if self.target_id_aux_weight <= 0:
+            for p in self.target_id_head.parameters():
+                p.requires_grad = False
+
         log_step(
             "Rank aux head",
             f"weight={self.rank_aux_weight}, d_q={d_q}, "
-            f"trainable={self.rank_aux_weight > 0}",
+            f"trainable={self.rank_aux_weight > 0} | "
+            f"target-id aux: weight={self.target_id_aux_weight}, d_cf={d_cf}",
         )
 
     def _log_trainable_module_stats(self):
@@ -774,6 +799,19 @@ class QRecLLM(Rec2Base):
             if self.rank_aux_weight > 0:
                 aux_logit = self.rank_head(cf_q.mean(dim=1)).squeeze(-1).float()
 
+            # CHANGE Q4: in-batch target-identity contrastive (training only).
+            # The pooled queries, mapped back to MF item space, must be closest
+            # to their OWN target embedding among the batch targets.
+            target_id_loss = None
+            if self.target_id_aux_weight > 0 and self.training and B > 1:
+                pred_t = nn.functional.normalize(
+                    self.target_id_head(cf_q.mean(dim=1)).float(), dim=-1
+                )
+                true_t = nn.functional.normalize(target_cf.float(), dim=-1)
+                ti_logits = pred_t @ true_t.T / 0.07
+                ti_labels = torch.arange(B, device=ti_logits.device)
+                target_id_loss = nn.functional.cross_entropy(ti_logits, ti_labels)
+
             merged_flat = None
             if feature_order and "<CFTokens>" in feature_order:
                 merged_flat = cf_llm.reshape(B * Q, H)
@@ -782,6 +820,7 @@ class QRecLLM(Rec2Base):
                 "CF_emb": cf_llm,            # [B, Q, H]
                 "merged_embs": merged_flat,  # [B*Q, H] or None
                 "aux_logit": aux_logit,      # [B] or None
+                "target_id_loss": target_id_loss,  # scalar or None
             }
             self._log_information_flow(None, cf_q, None, cf_llm, merged_flat)
 
@@ -1002,6 +1041,7 @@ class QRecLLM(Rec2Base):
                 "CF_emb": None,
                 "merged_embs": None,
                 "aux_logit": None,
+                "target_id_loss": None,
             }
             rec_atts = None
         else:
@@ -1012,9 +1052,10 @@ class QRecLLM(Rec2Base):
                 instruction_list=instruction_list,
             )
 
-        # CHANGE Q2: stash the ranking logit for the caller (forward_v2 adds
-        # the aux loss; generate_for_samples surfaces the standalone score).
+        # CHANGE Q2/Q4: stash the aux outputs for the caller (forward_v2 adds
+        # the aux losses; generate_for_samples surfaces the standalone score).
         self._last_aux_logit = rec_embeds.get("aux_logit")
+        self._last_target_id_loss = rec_embeds.get("target_id_loss")
 
         llm_embeds, llm_atts = self.wrap_prompt_with_soft_tokens_v2(rec_embeds, rec_atts, batch_data, prompt_template)
         return llm_embeds, llm_atts
@@ -1111,6 +1152,12 @@ class QRecLLM(Rec2Base):
             )
             loss = loss + self.rank_aux_weight * aux_loss
 
+        # CHANGE Q4: target-identity contrastive keeps target information
+        # flowing through the queries (see _init_rank_head for the diagnosis).
+        target_id_loss = getattr(self, "_last_target_id_loss", None)
+        if target_id_loss is not None and self.target_id_aux_weight > 0:
+            loss = loss + self.target_id_aux_weight * target_id_loss
+
         return {"loss": loss}
 
     def forward(self, samples):
@@ -1158,6 +1205,7 @@ class QRecLLM(Rec2Base):
         qformer_instruction_mode = qformer_config.get("instruction_mode", "static")
         item_noun = cfg.get("item_noun", "movie")
         rank_aux_weight = float(cfg.get("rank_aux_weight", 0.0))
+        target_id_aux_weight = float(cfg.get("target_id_aux_weight", 0.0))
         prompt_path_notitle = cfg.get("prompt_path_notitle", "")
         title_free_ratio = float(cfg.get("title_free_ratio", 0.0))
 
@@ -1195,6 +1243,7 @@ class QRecLLM(Rec2Base):
             qformer_instruction_mode=qformer_instruction_mode,
             item_noun=item_noun,
             rank_aux_weight=rank_aux_weight,
+            target_id_aux_weight=target_id_aux_weight,
             prompt_path_notitle=prompt_path_notitle,
             title_free_ratio=title_free_ratio,
         )
