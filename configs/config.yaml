@@ -1,23 +1,17 @@
 model:
   arch: mini_gpt4rec_v2
   model_type: pretrain_vicuna  # legacy key — `_init_llm_model` uses AutoModel, any HF causal LM works.
-  # CHANGE C: instruction-tuned backbone. Qwen2-7B-Instruct keeps the
-  # instruction-following prior that a Yes/No CTR-reasoning task benefits from.
-  # (To revert to the base model, set this back to ".../qwen2-7b-base" and the
-  # base-model `prompt_template` below.)
-  llm_model: "/content/SigLLM/ckpt/llm/qwen2-7b-instruct"
+  # BACKBONE (CHANGE C reverted): Qwen2-7B-BASE + completion prompt — the
+  # recipe this repo's ~0.694 ML-1M results were achieved with, and the one
+  # SeLLa-Rec/TALLRec publish against (Movie: TALLRec AUC 0.7268/uAUC 0.6989).
+  # On Amazon the Instruct+ChatML arm saturated ~0.09 below TALLRec; base
+  # models are also better calibrated for Yes/No-logit scoring.
+  # Instruct arm (for revert):
+  #   llm_model: ".../qwen2-7b-instruct"
+  #   prompt_template: "<|im_start|>system\nYou are a helpful movie recommendation assistant. Answer only with \"Yes\" or \"No\".<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+  llm_model: "/content/SigLLM/ckpt/llm/qwen2-7b-base"
   prompt_path: "/content/SigLLM/prompts/qformer_prompt_movie_mt.txt"
-  # CHANGE C: restore chat formatting using the Qwen2 ChatML template. The
-  # prompt body (with <CFTokens>/<ItemTitleList>/<TargetItemTitle> placeholders)
-  # is wrapped as the user turn; the model then continues the assistant turn
-  # with the "Yes"/"No" label. `add_special_tokens=False` tokenization keeps
-  # the <|im_start|>/<|im_end|> control tokens intact as single ids, and
-  # `_resolve_soft_token_placeholder` now excludes them so the soft-token slot
-  # never collides with chat control tokens.
-  #
-  # Legacy base-model template (use with qwen2-7b-base):
-  #   prompt_template: '{} Answer:'
-  prompt_template: "<|im_start|>system\nYou are a helpful movie recommendation assistant. Answer only with \"Yes\" or \"No\".<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+  prompt_template: '{} Answer:'
   
   freeze_rec: True
   freeze_proj: False
@@ -29,6 +23,23 @@ model:
   # trained checkpoint, flip this to True, re-evaluate. If AUC barely drops,
   # the Q-Former isn't contributing — the LLM is leaning on prompt text alone.
   ablate_soft_tokens: False
+
+  # CHANGE Q1-Q4 (ported from config_amazon; each independently revertible).
+  # Domain noun for per-sample Q-Former instructions.
+  item_noun: "movie"
+  # Q2: auxiliary direct-rank BCE on mean-pooled queries in step 2; surfaces
+  # qformer_AUC/qformer_uAUC at eval (standalone bridge quality vs MF's
+  # uAUC 0.6264 on this split). 0 = off.
+  rank_aux_weight: 1.0
+  # Q4: in-batch target-identity contrastive — forces target information
+  # through the 16-query bottleneck (on Amazon the queries provably dropped
+  # it: qformer_uAUC sat below raw MF). 0 = off.
+  target_id_aux_weight: 0.5
+  # Q3: with this probability a training batch uses a title-free prompt so the
+  # Yes/No loss must route through <CFTokens>. Eval always uses the titled
+  # prompt. 0 = off. (Step 1 force-disables this — it is a step-2 mechanism.)
+  prompt_path_notitle: "/content/SigLLM/prompts/qformer_prompt_movie_mt_notitle.txt"
+  title_free_ratio: 0.3
 
   # CoLLM-style 2-step tuning. Each Stage 3 pipeline script overrides this
   # from its own `run.qformer_stage3_step{1,2}` block (see
@@ -78,6 +89,9 @@ model:
 
   qformer_config:
     use_qformer: True
+    # Q1: per-sample instruction from the target movie's title (same sentence
+    # shape as the Stage-1 rich item text). "static" = legacy fixed templates.
+    instruction_mode: "target_title"
     qformer_ckpt: "${run.qformer_stage2.output_dir}${run.qformer_stage2.qformer_ckpt_out}" # Q-Former weights after Stage 2 generative pretraining
     llm_proj_ckpt: "${run.qformer_stage2.output_dir}${run.qformer_stage2.proj_ckpt_out}" # Projection weights after Stage 2 generative pretraining
     qformer_d_model: 768
@@ -113,6 +127,13 @@ run:
   output_dir: "ckpt/qformer_stage3_default"
   device: "cuda"
   seed: 42
+  # Best-checkpoint / early-stop selection metric (see config_amazon for the
+  # 'auc+uauc' composite option). uAUC is the headline vs CoLLM/SeLLa.
+  best_metric: uauc
+  # ML-1M protocol note: the SeLLa/CoLLM Movie split has NO >20-interaction
+  # filter (that is Book-only, applied at dataset construction), so the metric
+  # filter stays OFF here and 'uauc' == 'uauc_all'.
+  uauc_min_interactions: 0
   rec_baseline:
     save_file: ${model.rec_config.pretrained_path}
     need_train: True
@@ -130,8 +151,12 @@ run:
     # own text branch (no external BERT). Item-item contrastive (w_ii) is a
     # SigLLM-specific addition for co-watch collaborative signal.
     seed: 2025
+    # Batch kept at the ML-1M-validated 256 (only ~3.3k item-text rows here —
+    # a 1024 batch would break the balanced-batch guarantee). bf16 autocast is
+    # a safe throughput win on Ampere+ regardless.
     batch_size: 256
-    num_workers: 4
+    num_workers: 8
+    amp_bf16: True
     embedding_size: ${model.rec_config.embedding_size}
     user_num: ${model.rec_config.user_num}
     item_num: ${model.rec_config.item_num}
@@ -230,7 +255,11 @@ run:
     output_dir: "/content/SigLLM/ckpt/qformer_stage3_step1_lora_qwen2/"
     best_ckpt_name: "checkpoint_best.pth"
     init_lr: 2e-4
-    max_epoch: 5
+    # 40 epochs x 400 iters x batch 16 = 256k samples ~= 7.5 passes over the
+    # 33.9k-row train split (CoLLM's tallrec budget is up to 800k adaptive).
+    # Early stop ends it when valid uAUC stalls. Gate for step 2: ~0.68+
+    # (TALLRec-Movie reference: 0.6989).
+    max_epoch: 40
 
   qformer_stage3_step2:
     # CoLLM Step 2 — train Q-Former + projection on the full prompt, LoRA
@@ -256,13 +285,17 @@ run:
   # CHANGE 2i: extra LR for the Q-Former/projection bridge (lr = init_lr * mult,
   # honored across warmup+cosine). 1.0 = off. Raise (e.g. 3-5) to push more
   # gradient/step into the bridge under the frozen LLM; sweep and watch val uAUC.
-  qformer_lr_mult: 1.0
-  
+  qformer_lr_mult: 3.0
+
   # Training Schedule
   max_epoch: 200
   iters_per_epoch: 400
+  # ML-1M evals are cheap (valid = 10.4k rows, ~2 min) — evaluate every epoch
+  # for maximum best-checkpoint granularity on the noisy uAUC metric.
+  valid_freq: 1
+  early_stop_patience: 20
   batch_size_train: 16
-  batch_size_eval: 64
+  batch_size_eval: 128
   num_workers: 4
   warmup_steps: 200
   
