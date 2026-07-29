@@ -463,7 +463,7 @@ def _item_text_only(dataset):
 
 
 def build_item_text_eval_loader(cfg, data_dir, filename, batch_size):
-    """One-batch-per-split loader over the item_text rows only.
+    """Fixed-``n`` loader over the item_text rows only.
 
     The main loaders mix sample types, so ``n_item_text`` per batch depends on
     the split's composition: with the item-level holdout, a val batch carries a
@@ -471,9 +471,18 @@ def build_item_text_eval_loader(cfg, data_dir, filename, batch_size):
     retrieval chance is ``1/n``, so val ITC@1 looks better than train for free,
     ITM has almost no hard negative to mine from a tiny similarity matrix and
     parks at its trivial 2/3 baseline, and L_llm is capped at ``ln(n)`` well
-    below the train figure. This loader fixes ``n`` across splits by putting the
-    whole held-out item_text block in one batch, so the numbers are directly
-    comparable. Set ``item_text_eval_batch_size`` >= the largest held-out block.
+    below the train figure.
+
+    ``drop_last=True`` is what actually pins ``n``: without it the last batch of
+    each split is whatever remains (a 205-row val block and a 2600-row train
+    block yield different tail sizes), so the per-split averages would still mix
+    chance levels and stay incomparable. With it, every contributing batch holds
+    exactly ``batch_size`` rows on every split.
+
+    Consequence: ``item_text_eval_batch_size`` must be **<= the SMALLEST**
+    held-out item_text block, not >= the largest — a split with fewer rows than
+    one batch yields zero batches and drops out of the diagnostic entirely
+    (callers check ``len(loader)`` and warn).
     """
 
     class _BatchSizeCfg:
@@ -486,6 +495,7 @@ def build_item_text_eval_loader(cfg, data_dir, filename, batch_size):
         filename=os.path.join(data_dir, filename),
         shuffle=False,
         filter_fn=_item_text_only,
+        drop_last=True,
     )
 
 
@@ -673,15 +683,32 @@ def train_qformer_stage1_representation(cfg):
             loader = build_item_text_eval_loader(
                 cfg, cfg.data_dir, filename, item_text_eval_batch
             )
-            if len(loader.dataset) > 0:
+            # len(loader), not len(loader.dataset): drop_last means a split with
+            # fewer item_text rows than one batch produces ZERO batches, and
+            # every metric would come back as a silent 0.0.
+            if len(loader) > 0:
                 item_text_loaders[split] = loader
-        log_step(
-            "Diagnostics enabled",
-            "fixed-n item_text eval ("
-            + ", ".join(f"{s}={len(l.dataset)} rows" for s, l in item_text_loaders.items())
-            + f", batch={item_text_eval_batch}) + CF-only (sem off) pass every "
-            f"{diag_every} epoch(s)",
-        )
+            else:
+                log_step(
+                    "WARNING",
+                    f"item_text diagnostic skipped for {split}: "
+                    f"{len(loader.dataset)} item_text rows < "
+                    f"item_text_eval_batch_size={item_text_eval_batch}. Lower that "
+                    f"key to at most the smallest held-out block.",
+                )
+        if item_text_loaders:
+            log_step(
+                "Diagnostics enabled",
+                "fixed-n item_text eval ("
+                + ", ".join(
+                    f"{s}={len(l) * item_text_eval_batch}/{len(l.dataset)} rows"
+                    f" in {len(l)} batch(es)"
+                    for s, l in item_text_loaders.items()
+                )
+                + f", n={item_text_eval_batch} per batch, chance="
+                f"{1.0 / item_text_eval_batch:.4f}) + CF-only (sem off) pass every "
+                f"{diag_every} epoch(s)",
+            )
 
     def run_diagnostics(epoch_index):
         """Fixed-n item_text metrics, with the semantic source on and off."""

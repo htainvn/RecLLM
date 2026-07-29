@@ -47,13 +47,17 @@ from sigllm.runners.runner_base_rec import RecRunnerBase  # noqa: F401  (registr
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate a trained Stage-3 model on the test splits")
     parser.add_argument("--cfg-path", type=str, required=True, help="Path to the config file.")
-    parser.add_argument("--step", type=int, default=2, choices=[1, 2],
-                        help="Which Stage-3 step's model to evaluate (1=text-only LoRA, 2=full).")
+    parser.add_argument("--step", type=int, default=2, choices=[1, 2, 3],
+                        help="Which Stage-3 step's model to evaluate "
+                             "(1=text-only LoRA, 2=full, 3=joint MF+Q-Former+proj+LoRA).")
     parser.add_argument("--model-ckpt", type=str, default=None,
-                        help="Checkpoint loaded as model.ckpt (LoRA). Defaults to Step 1's best.")
+                        help="Checkpoint loaded as model.ckpt. Defaults to Step 1's best for "
+                             "steps 1-2, and to Step 3's best for step 3 (which carries every "
+                             "trained module, including MF).")
     parser.add_argument("--overlay-ckpt", type=str, default=None,
                         help="Step 2 runner checkpoint to overlay (Q-Former/proj/injector). "
-                             "Step 2 only; defaults to Step 2's best.")
+                             "Step 2 only; defaults to Step 2's best. Unused for step 3, whose "
+                             "single checkpoint already holds all trained weights.")
     parser.add_argument("--options", nargs="+", help="override some settings in the used config")
     return parser.parse_args()
 
@@ -85,6 +89,25 @@ def main():
         model_ckpt = args.model_ckpt or _default_ckpt(
             step1.output_dir, slug, step1.best_ckpt_name)
         cfg.model_cfg.ckpt = model_ckpt
+    elif args.step == 3:
+        # Joint tuning trained LoRA + Q-Former + projection + MF, so all of
+        # them are in the ONE runner checkpoint (the saver keeps every
+        # trainable tensor) — no overlay needed. MF in particular must come
+        # from here: from_config detects the rec_encoder.* keys and skips the
+        # pretrained-MF restore that would otherwise overwrite the jointly
+        # trained embeddings with mf_model.pth.
+        step3 = cfg.run_cfg.qformer_stage3_step3
+        cfg.model_cfg.tuning_step = 3
+        cfg.model_cfg.prompt_path = step3.prompt_path
+        cfg.model_cfg.freeze_rec = False
+        model_ckpt = args.model_ckpt or _default_ckpt(
+            step3.output_dir, slug, step3.get("best_ckpt_name", "checkpoint_best.pth"))
+        cfg.model_cfg.ckpt = model_ckpt
+        if args.overlay_ckpt:
+            raise ValueError(
+                "--overlay-ckpt is not applicable to step 3: its single checkpoint "
+                "already contains every trained module. Pass --model-ckpt instead."
+            )
     else:
         step2 = cfg.run_cfg.qformer_stage3_step2
         cfg.model_cfg.tuning_step = 2

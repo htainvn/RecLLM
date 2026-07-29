@@ -196,10 +196,13 @@ run:
     # (1/n) differs between train and val — val ITC@1 then looks better than
     # train for free, ITM parks at its trivial 2/3 baseline for lack of hard
     # negatives, and L_llm is capped at ln(n) below the train figure. This runs
-    # an extra measurement-only pass over the item_text rows ALONE with one big
-    # batch per split, so n (and chance) match across splits. Must be >= the
-    # largest held-out item_text block (~10% of the catalog here).
-    item_text_eval_batch_size: 512
+    # an extra measurement-only pass over the item_text rows ALONE, with
+    # drop_last so EVERY batch holds exactly this many rows on every split —
+    # that is what makes n (and chance) identical across train/val/test.
+    # Because the tail is dropped, this must be <= the SMALLEST held-out
+    # item_text block (~10% of the catalog per eval split); a split with fewer
+    # rows than one batch yields no batches and is skipped with a warning.
+    item_text_eval_batch_size: 205
     # Same pass is repeated with the semantic cross-attention source FORCED OFF
     # (the sem_dropout gate is train-only, so ordinary eval runs it at full
     # strength). sem_on vs sem_off separates "the CF path learned this" from
@@ -499,6 +502,51 @@ run:
     min_lr: 3e-6
     max_epoch: 200
 
+  qformer_stage3_step3:
+    # JOINT tuning — MF + Q-Former + projection + LoRA all trainable, base LLM
+    # frozen. Steps 1 and 2 each freeze what the other trains, so neither lets
+    # the CF encoder co-adapt with the channel that reads it; this step does.
+    # Run it AFTER step 1 (and optionally step 2), never instead of them.
+    prompt_path: "/content/SigLLM/prompts/qformer_prompt_movie.txt"
+    output_dir: "/content/SigLLM/ckpt/qformer_stage3_step3_joint_qwen2/"
+    best_ckpt_name: "checkpoint_best.pth"
+    # Which checkpoint to warm-start from: step1 | step2.
+    # step1 (default): LoRA already knows how to READ the soft-token channel,
+    # while Q-Former/projection come from Stage 2. step2: also inherits the
+    # step-2-adapted Q-Former/projection. Do NOT start cold — with everything
+    # trainable and the channel still noisy, LoRA learns to answer from prompt
+    # text alone and the soft tokens never earn their weight.
+    ckpt_from: step1
+    # Below step 2's 3e-5: four module groups now move at once (LoRA + Q-Former
+    # + projection + MF), so the same per-module step size compounds into a
+    # much larger change in the composed function.
+    init_lr: 1e-5
+    # Must be set together with init_lr — the top-level min_lr (8e-5) is far
+    # ABOVE this, which would invert the cosine schedule into a climb. Same
+    # trap as steps 1 and 2.
+    min_lr: 1e-6
+    max_epoch: 50
+    # MF learning rate = init_lr * rec_lr_scale (its own optimizer param group;
+    # see build_optimizer and the lr_scale handling in common/optims.py, since
+    # the schedulers overwrite every group's lr on every step).
+    #
+    # 0.05 -> effective 5e-7. MF must move MUCH slower than the modules reading
+    # it: Stage 1/2 aligned the Q-Former against a FIXED MF geometry, so a
+    # fast-moving MF invalidates that alignment faster than the Q-Former can
+    # track it — the same class of failure as A/B run (b), where a low-dim
+    # gradient axis collapsed the shared body (val g_ii 3.25 -> 0.34). With
+    # 839 users / 3256 items / ~33k samples, MF also memorizes quickly under a
+    # per-user BPR. Watch the "MF drift" log line: rising drift with flat or
+    # falling val uAUC means lower this; drift ~0 means MF is effectively frozen
+    # and this step is only step 2 plus LoRA.
+    rec_lr_scale: 0.05
+    # 1e-4, matching what the MF baseline was trained with
+    # (run.rec_baseline.wd). The generic optimizer rule files any 2-D tensor
+    # under the global weight_decay (1e-3), which is 10x too strong for
+    # embedding tables — there decay drags rows that a batch never visits
+    # toward zero.
+    rec_weight_decay: 1e-4
+
   # Optimization
   lr_sched: "linear_warmup_cosine_lr"
   init_lr: 1e-4
@@ -506,6 +554,11 @@ run:
   warmup_lr: 1e-5
   weight_decay: 1e-3
   amp: True
+  # MF optimizer group defaults. Only take effect when MF is trainable, i.e.
+  # tuning_step=3; steps 1/2 filter it out via requires_grad and the optimizer
+  # builds the same two groups as before. The step-3 block overrides both.
+  rec_lr_scale: 1.0
+  rec_weight_decay: 1e-4
   
   # Training Schedule
   max_epoch: 200

@@ -124,9 +124,14 @@ class QRecLLM(Rec2Base):
         sem_source=False,
         item_sem_emb_path=None,
         sem_source_dropout=0.5,
+        mf_drift_log_steps=200,
     ):
         super().__init__()
 
+        # How often (training steps) to log the joint-tuning MF drift
+        # diagnostic. Only fires when tuning_step=3 took a weight snapshot;
+        # 0 disables. See _maybe_log_mf_drift.
+        self.mf_drift_log_steps = int(mf_drift_log_steps)
         self.proj_token_num = proj_token_num
         self._has_logged_trainable_stats = False
         self._flow_log_steps = 0
@@ -217,12 +222,26 @@ class QRecLLM(Rec2Base):
     def _init_rec_model(self, rec_model, rec_config, pretrained_rec, freeze_rec):
         log_step("Loading Rec_model")
         self.rec_encoder = self.init_rec_encoder(rec_model, rec_config)
-        
+
         if self.rec_encoder is not None and pretrained_rec != "not_have":
             self.rec_encoder.load_state_dict(torch.load(pretrained_rec, map_location="cpu"))
             log_step("Successfully loaded the pretrained model")
-        
-        if freeze_rec and self.rec_encoder is not None:
+
+        # Step 3 (joint tuning) trains the MF embeddings. Skip the freeze here
+        # rather than undoing it in the step policy: freezing installs a
+        # ``train = disabled_train`` patch on the instance, and an un-patch is
+        # easy to get subtly wrong (the attribute shadows the class method, so
+        # it must be deleted, not reassigned). Not applying it is exact.
+        joint_step = self.tuning_step is not None and int(self.tuning_step) == 3
+        if joint_step and freeze_rec:
+            log_step(
+                "freeze_rec OVERRIDDEN",
+                "tuning_step=3 trains MF jointly, so the configured "
+                "freeze_rec=True is ignored for the rec encoder. Set "
+                "model.freeze_rec: False explicitly to silence this.",
+            )
+
+        if freeze_rec and not joint_step and self.rec_encoder is not None:
             for name, param in self.rec_encoder.named_parameters():
                 param.requires_grad = False
             self.rec_encoder = self.rec_encoder.eval()
@@ -384,6 +403,59 @@ class QRecLLM(Rec2Base):
             log_step(
                 "Tuning step 2",
                 "Q-Former + projection + warm_proj trainable; LoRA, base LLM and MF frozen.",
+            )
+
+        elif int(step) == 3:
+            # JOINT tuning: LoRA + Q-Former + projection + MF all trainable,
+            # base LLM still frozen. Steps 1 and 2 each freeze exactly what the
+            # other trains, so neither can co-adapt the CF encoder with the
+            # channel that reads it; this step does.
+            #
+            # Warm-start from the Step-1 LoRA checkpoint rather than from cold:
+            # with everything trainable at once and the soft-token channel still
+            # noisy, LoRA takes the cheaper route and learns to answer from the
+            # prompt text alone — the same failure that made Step 2 flat when
+            # Step 1 had been trained on the text-only prompt.
+            #
+            # MF carries the geometry Stage 1/2 aligned against, so it must move
+            # SLOWLY: see run.rec_lr_scale (its own optimizer param group) and
+            # the mf_drift diagnostic. A fast-moving MF invalidates the
+            # alignment those stages produced, which is the same class of
+            # failure as the collapsed-body A/B run (b).
+            if hasattr(self.llm_model, "peft_config"):
+                for n, p in self.llm_model.named_parameters():
+                    if "lora_" in n:
+                        p.requires_grad = True
+            for p in self.qformer.parameters():
+                p.requires_grad = True
+            self.qformer.train()
+            for p in self.llm_proj.parameters():
+                p.requires_grad = True
+            self.llm_proj.train()
+            if getattr(self, "warm_proj", None) is not None:
+                for p in self.warm_proj.parameters():
+                    p.requires_grad = True
+                self.warm_proj.train()
+
+            # MF was left unfrozen by _init_rec_model for this step. Assert it
+            # rather than assume: a stale freeze here would train everything
+            # else and silently reduce Step 3 to Step 2 plus LoRA.
+            if self.rec_encoder is not None:
+                frozen = [n for n, p in self.rec_encoder.named_parameters() if not p.requires_grad]
+                if frozen:
+                    raise RuntimeError(
+                        "tuning_step=3 requires a trainable rec encoder but these "
+                        f"parameters are frozen: {frozen}. _init_rec_model should have "
+                        "skipped the freeze — check that model.tuning_step was set "
+                        "BEFORE the model was built (apply_step3_overrides does this)."
+                    )
+                self.rec_encoder.train()
+                self._snapshot_mf_weights()
+
+            log_step(
+                "Tuning step 3 (JOINT)",
+                "LoRA + Q-Former + projection + warm_proj + MF trainable; base LLM frozen. "
+                "MF should use a reduced LR (run.rec_lr_scale) — watch mf_drift.",
             )
 
         else:
@@ -581,6 +653,87 @@ class QRecLLM(Rec2Base):
             f"Carries LLM semantic knowledge for cold-start items."
         )
 
+    def _snapshot_mf_weights(self):
+        """Snapshot the MF weights for the ``mf_drift`` diagnostic.
+
+        Taken during ``__init__`` (from the step policy), which is BEFORE
+        ``from_config`` applies any ``model.ckpt``. The reference is therefore
+        the **pretrained** MF — precisely the geometry Stage 1/2 aligned the
+        Q-Former against — and not "wherever this run happened to resume from".
+        That is the intended baseline: the question drift answers is how far MF
+        has moved away from the alignment those stages were built on, so a
+        resumed run should keep measuring against the same origin.
+
+        Costs one extra copy of the embedding tables (~4 MB at 4k ids x 256
+        dims), kept on CPU so it never competes with activations for GPU
+        memory. Only taken for tuning_step=3; every other step has MF frozen,
+        where drift is zero by construction.
+        """
+        self._mf_init_weights = {
+            name: param.detach().to("cpu", copy=True)
+            for name, param in self.rec_encoder.named_parameters()
+        }
+
+    @torch.no_grad()
+    def mf_drift(self):
+        """Relative movement of the MF weights away from the pretrained MF, as
+        ``{name: ||W - W0|| / ||W0||}`` plus an ``overall`` figure. See
+        ``_snapshot_mf_weights`` for what W0 is.
+
+        This is the early-warning signal for the main risk of joint tuning: the
+        Stage-1/2 alignment was learned against a FIXED MF geometry, so if MF
+        moves far, that alignment is being invalidated while the LLM-side
+        channel tries to chase it. Read it together with val uAUC — rising
+        drift with flat or falling uAUC means the MF LR is too high (lower
+        ``run.rec_lr_scale``); near-zero drift means MF is effectively frozen
+        and Step 3 is not buying anything over Step 2.
+
+        Returns an empty dict when no snapshot exists (any step but 3).
+        """
+        snapshot = getattr(self, "_mf_init_weights", None)
+        if not snapshot or self.rec_encoder is None:
+            return {}
+
+        drift = {}
+        total_sq, base_sq = 0.0, 0.0
+        for name, param in self.rec_encoder.named_parameters():
+            if name not in snapshot:
+                continue
+            initial = snapshot[name].to(param.device, dtype=param.dtype)
+            delta_sq = (param.detach() - initial).pow(2).sum().item()
+            initial_sq = initial.pow(2).sum().item()
+            drift[name] = (delta_sq ** 0.5) / (initial_sq ** 0.5 + 1e-12)
+            total_sq += delta_sq
+            base_sq += initial_sq
+        drift["overall"] = (total_sq ** 0.5) / (base_sq ** 0.5 + 1e-12)
+        return drift
+
+    def _maybe_log_mf_drift(self):
+        """Log ``mf_drift`` every ``mf_drift_log_steps`` training steps.
+
+        Drift is only useful as an EARLY warning — knowing at the end of a
+        200-epoch run that MF walked too far is knowing too late. Throttled
+        because it touches every MF parameter; at the default interval the cost
+        is two reductions over ~1M params plus a 4 MB host-to-device copy of
+        the snapshot, which is noise next to one LLM forward.
+        """
+        if not self.training or not getattr(self, "_mf_init_weights", None):
+            return
+        interval = int(getattr(self, "mf_drift_log_steps", 200))
+        if interval <= 0:
+            return
+        self._mf_drift_step = getattr(self, "_mf_drift_step", 0) + 1
+        if self._mf_drift_step % interval != 0:
+            return
+        drift = self.mf_drift()
+        if drift:
+            log_step(
+                f"MF drift (step {self._mf_drift_step})",
+                ", ".join(f"{k}={v:.5f}" for k, v in sorted(drift.items()))
+                + " | ||W-W0||/||W0||; rising drift with flat val uAUC means "
+                "run.rec_lr_scale is too high",
+            )
+
     def _log_trainable_module_stats(self):
         if self._has_logged_trainable_stats:
             return
@@ -728,6 +881,7 @@ class QRecLLM(Rec2Base):
             return None, None
 
         self._log_trainable_module_stats()
+        self._maybe_log_mf_drift()
 
         device = batch_data["UserID"].device
         B = batch_data["UserID"].shape[0]
@@ -1122,9 +1276,10 @@ class QRecLLM(Rec2Base):
         # alignment itself, not just the LLM's Yes/No verdict, is pushed to
         # preserve within-user ordering. Targets uAUC at the alignment level.
         # fp32 score keeps the ranking tie-free; needs a user-grouped sampler.
-        # Only at Step 2 (CIE): that is where the Q-Former + projection (the
-        # alignment) are trainable.
-        if (self.training and self.tuning_step == 2
+        # Steps 2 and 3: both leave the Q-Former + projection (the alignment)
+        # trainable, which is what this term shapes. At Step 1 they are frozen,
+        # so the gradient would have nowhere to go except the aux head.
+        if (self.training and self.tuning_step in (2, 3)
                 and self.align_rank_loss_weight > 0.0
                 and self.align_rank_head is not None and cf_emb is not None
                 and 'UserID' in batch_data):
@@ -1376,6 +1531,7 @@ class QRecLLM(Rec2Base):
             sem_source=sem_source,
             item_sem_emb_path=item_sem_emb_path,
             sem_source_dropout=sem_source_dropout,
+            mf_drift_log_steps=int(cfg.get("mf_drift_log_steps", 200)),
         )
 
         ckpt_path = cfg.get("ckpt", "")
@@ -1384,8 +1540,39 @@ class QRecLLM(Rec2Base):
             ckpt = torch.load(ckpt_path, map_location="cpu")
             msg = model.load_state_dict(ckpt['model'], strict=False)
             log_step("loading message, msg.... {}".format(msg))
-            if os.path.exists(rec_config['pretrained_path']) and freeze_rec:
-                model.rec_encoder.load_state_dict(torch.load(rec_config['pretrained_path'], map_location="cpu"))
+
+            # Restore the pretrained MF ONLY when the checkpoint does not carry
+            # its own copy. The runner strips non-trainable tensors when saving,
+            # so a Step-1/2 checkpoint has no ``rec_encoder.*`` keys and the
+            # reload is what puts MF back after the strict=False load; but a
+            # JOINT (Step-3) checkpoint does carry them, and reloading
+            # mf_model.pth over those would silently throw away every MF update
+            # the joint run produced — including at eval time, where the model
+            # scored would no longer be the model trained.
+            #
+            # Keyed on the checkpoint contents, not on ``freeze_rec``: the two
+            # only coincided by accident (freeze_rec=True <=> MF absent from the
+            # checkpoint), and eval flows commonly leave freeze_rec at its
+            # config default while loading a joint checkpoint — exactly the case
+            # the old condition got wrong.
+            ckpt_has_rec = any(
+                isinstance(k, str) and k.startswith("rec_encoder.") for k in ckpt["model"]
+            )
+            if ckpt_has_rec:
+                log_step(
+                    "Kept MF weights from the checkpoint",
+                    "checkpoint carries rec_encoder.* (joint tuning); NOT reloading "
+                    f"{rec_config['pretrained_path']}",
+                )
+            elif os.path.exists(rec_config["pretrained_path"]):
+                model.rec_encoder.load_state_dict(
+                    torch.load(rec_config["pretrained_path"], map_location="cpu")
+                )
+                log_step(
+                    "Restored pretrained MF",
+                    f"checkpoint carried no rec_encoder.* keys; loaded "
+                    f"{rec_config['pretrained_path']}",
+                )
 
         ans_type = cfg.get('ans_type')
         model.set_answer_type(mode=ans_type)

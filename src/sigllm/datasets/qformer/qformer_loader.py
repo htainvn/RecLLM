@@ -49,6 +49,7 @@ def build_qformer_loader(
     shuffle: bool,
     filter_fn: Optional[FilterFn] = None,
     permute_seed: Optional[int] = None,
+    drop_last: bool = False,
 ) -> DataLoader:
     """Build a single Q-Former DataLoader from a samples pickle.
 
@@ -81,6 +82,13 @@ def build_qformer_loader(
         the ordering identical across epochs, so epoch-to-epoch validation
         deltas reflect the model rather than resampling noise (which matters
         because early stopping reads those deltas).
+    drop_last
+        Drop the final short batch. Set this on loaders whose metrics are read
+        as in-batch retrieval numbers: chance accuracy is ``1/n``, so a ragged
+        tail batch contributes rows measured against a different (easier)
+        chance level and silently shifts the average. With it on, EVERY batch
+        holds exactly ``cfg.batch_size`` rows, which is what makes the numbers
+        comparable across splits of different sizes.
     """
     dataset: Dataset = QFormerAlignmentDataset(filename=filename)
     if filter_fn is not None:
@@ -93,6 +101,7 @@ def build_qformer_loader(
         dataset,
         batch_size=int(cfg.batch_size),
         shuffle=shuffle,
+        drop_last=bool(drop_last),
         collate_fn=qformer_collate,
         num_workers=int(cfg.num_workers),
     )
