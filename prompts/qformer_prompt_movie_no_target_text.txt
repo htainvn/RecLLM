@@ -1,0 +1,23 @@
+A user's collaborative taste profile is: <UserProfile>. They have highly rated these movies: <ItemTitleList>. Leverage the information above to predict whether the user would enjoy this movie: <TargetItemID> The semantic profile of this movie is: <Warm_ID> Answer with "Yes" or "No".
+A user's collaborative taste profile is: <UserProfile>. They previously gave strong ratings to: <ItemTitleList>. Based on this preference history, predict whether the user would like this movie: <TargetItemID> The semantic profile of this movie is: <Warm_ID> Answer with "Yes" or "No".
+Given a user's collaborative taste profile <UserProfile> and their highly rated movies <ItemTitleList>, decide whether the user would enjoy this movie: <TargetItemID> The semantic profile of this movie is: <Warm_ID> Answer with "Yes" or "No"
+# Variant of qformer_prompt_movie.txt with <TargetItemTitle> REMOVED.
+#
+# The target item now reaches the LLM ONLY as <TargetItemID> (8 soft tokens from
+# the Q-Former). History still arrives both ways, so this isolates exactly one
+# variable: how much of the score comes from the target item's TITLE TEXT.
+#
+# Motivating observation: removing all 10 history titles (no_hist_text) barely
+# moved uAUC, which raises the possibility that most of the signal never came
+# from user history at all but from the target item's text — i.e. the model is
+# answering "is this movie generally liked?" rather than "would THIS user like
+# it?". That would explain uAUC sitting at ~0.70 regardless of Stage-1 work, and
+# it would explain not beating plain MF (0.7077).
+#
+# Read as: uAUC collapses -> target text was the main source, and the
+# collaborative channel contributes little. uAUC holds -> <TargetItemID> soft
+# tokens carry the item identity adequately.
+#
+# Both <UserProfile> and <TargetItemID> must stay present: encode_rec_features_
+# to_llm_v2 only builds merged_embs when BOTH placeholders are in feature_order,
+# so dropping either disables soft-token injection entirely.
