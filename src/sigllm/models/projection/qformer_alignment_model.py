@@ -97,6 +97,7 @@ class QRecInstructAlignmentModel(nn.Module):
         item_sem_emb=None,
         sem_dropout=0.5,
         pair_logit_center=True,
+        itc_logit_center=True,
     ) -> None:
         super().__init__()
         self.mf = mf
@@ -105,7 +106,7 @@ class QRecInstructAlignmentModel(nn.Module):
         # (L_ii / L_ui) before the cosine. See _pooled_pair_logits for the
         # measured comparison; False restores the uncentered form for an A/B.
         self.pair_logit_center = bool(pair_logit_center)
-
+        self.itc_logit_center = bool(itc_logit_center)
         # Optional semantic cross-attention source (see HFQFormerAdapter.d_sem):
         # the RAW distilled bank, deliberately NOT normalize_item_llm_emb'd —
         # normalization conditions the contrastive TARGET geometry; the source
@@ -215,7 +216,7 @@ class QRecInstructAlignmentModel(nn.Module):
         return text_cls
 
     @staticmethod
-    def _max_query_logits(query_tokens: torch.Tensor, target_vecs: torch.Tensor, tau: float):
+    def _max_query_logits(query_tokens: torch.Tensor, target_vecs: torch.Tensor, tau: float, center: bool = False,):
         """In-batch logits between a query BAG and a set of single target
         vectors: ``logits[b, c] = max_q cos(query_tokens[b, q], target_vecs[c])``.
 
@@ -237,6 +238,9 @@ class QRecInstructAlignmentModel(nn.Module):
         mean-pooled to a single vector, so no query-index-matching shortcut
         exists and every candidate is still scored by its own best query.
         """
+        if center and query_tokens.size(0) >= 4:
+            query_tokens = query_tokens - query_tokens.mean(dim=0, keepdim=True)
+            target_vecs = target_vecs - target_vecs.mean(dim=0, keepdim=True)
         q_norm = QRecInstructAlignmentModel.l2norm(query_tokens)               # [B, Q, D]
         t_norm = QRecInstructAlignmentModel.l2norm(target_vecs)                # [C, D]
         return torch.einsum("bqd,cd->bcq", q_norm, t_norm).max(dim=-1).values / tau
@@ -259,7 +263,7 @@ class QRecInstructAlignmentModel(nn.Module):
         # BLIP-2 ITC: score EVERY (item, text) candidate pair as the max over
         # the item's queries (see _max_query_logits), so negatives get the same
         # best-query treatment as the positive.
-        sim_matrix = self._max_query_logits(query_hidden, text_cls, tau)
+        sim_matrix = self._max_query_logits(query_hidden, text_cls, tau, center=self.itc_logit_center)
 
         labels = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
         loss_q2t = F.cross_entropy(sim_matrix, labels)
@@ -654,7 +658,7 @@ class QRecInstructAlignmentModel(nn.Module):
         query_hidden = self.encode_item_queries(item_ids)                       # [B, Q, d_model]
         soft_tokens = self.llm_align_proj(self.qformer.out_proj(query_hidden))  # [B, Q, d_llm]
         t_vec = self.item_llm_emb[item_ids].to(soft_tokens.device)
-        sim_matrix = self._max_query_logits(soft_tokens, t_vec, tau)
+        sim_matrix = self._max_query_logits(soft_tokens, t_vec, tau, center=self.itc_logit_center)
         labels = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
         loss_q2t = F.cross_entropy(sim_matrix, labels)
         if symmetric:

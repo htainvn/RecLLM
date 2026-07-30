@@ -93,16 +93,49 @@ def _init_qformer(cfg, d_model, device, d_sem=None):
     ).to(device)
 
 
-def _init_optimizer(model, lr, weight_decay=0.0):
+def _init_optimizer(model, lr, weight_decay=0.0, decoupled_weight_decay=True):
     """
     Initializes the Adam optimizer for trainable parameters.
     """
-    return Adam(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=lr,
-        weight_decay=weight_decay,
-    )
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        (no_decay if param.ndim <= 1 or name.endswith(".bias") else decay).append(param)
 
+    param_groups = [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    optimizer_cls = torch.optim.AdamW if decoupled_weight_decay else Adam
+    return optimizer_cls(param_groups, lr=lr)
+
+def _offdiag_cos(x: torch.Tensor) -> float:
+    x = x / (x.norm(dim=-1, keepdim=True) + 1e-12)
+    sim = x @ x.T
+    n = sim.size(0)
+    return float((sim.sum() - sim.diagonal().sum()) / (n*(n-1)))
+
+@torch.no_grad()
+def _query_anisotropy(model, loader, max_rows: int = 512):
+    batch = next(iter(loader), None)
+    if batch is None:
+        return None
+    device = next(model.parameters()).device
+    item_ids = batch["i_left"][:max_rows].to(device)
+    if item_ids.numel() < 4:
+        return None
+
+    was_training = model.training
+    model.eval()
+    pooled = model.encode_item_queries(item_ids).mean(dim=1)
+    if was_training:
+        model.train()
+    return {
+        "n": int(item_ids.numel()),
+        "raw": _offdiag_cos(pooled),
+        "centered": _offdiag_cos(pooled - pooled.mean(dim=0, keepdim=True))
+    }
 
 def _log_batch_preview(batch, prefix: str = "train_step"):
     """Print a compact preview of the current batch for debugging."""
@@ -624,6 +657,7 @@ def train_qformer_stage1_representation(cfg):
         item_sem_emb=item_sem_emb,
         sem_dropout=sem_dropout,
         pair_logit_center=bool(cfg.get("pair_logit_center", True)),
+        itc_logit_center=bool(cfg.get("itc_logit_center", True))
     ).to(device)
 
     # DIN-style pretraining of the candidate-conditioning path: only possible
@@ -664,7 +698,7 @@ def train_qformer_stage1_representation(cfg):
         float(cfg.get("select_w_ui", w_ui)),
     )
 
-    opt = _init_optimizer(model, cfg.lr, weight_decay=cfg.weight_decay)
+    opt = _init_optimizer(model, cfg.lr, weight_decay=cfg.weight_decay, decoupled_weight_decay=bool(cfg.get("decoupled_weight_decay", True)))
 
     # Fixed-n item_text eval (see build_item_text_eval_loader) plus the CF-only
     # diagnostic. Both are measurement-only: no gradient, no effect on selection
@@ -712,6 +746,16 @@ def train_qformer_stage1_representation(cfg):
 
     def run_diagnostics(epoch_index):
         """Fixed-n item_text metrics, with the semantic source on and off."""
+        probe_loader = item_text_loaders.get("val") or next(iter(item_text_loaders.values()))
+        anisotropy = _query_anisotropy(model, probe_loader)
+        if anisotropy is not None:
+            log_step(
+                f"[DIAG ep{epoch_index}] query geometry",
+                f"n={anisotropy['n']} offdiag_cos_raw={anisotropy['raw']:.4f}"
+                f"offdiag_cos_centered={anisotropy['centered']:.4f}"
+                f"(raw near 1.0 = every item encodes to the same direction; "
+                f"uncentered cosine losses cannot resolve item below ~0.99",
+            )
         for split, loader in item_text_loaders.items():
             for tag, ctx in (
                 ("sem_on", contextlib.nullcontext()),
@@ -769,6 +813,11 @@ def train_qformer_stage1_representation(cfg):
     # lucky dips as "best". 0.0 disables (raw metric, old behaviour).
     selection_ema = float(cfg.get("selection_ema", 0.5))
     selection_ema_value = None
+    min_gain_itc = float(cfg.get("min_gain_itc", 0.05))
+    collapse_patience = int(cfg.get("collapse_patience", 3))
+    collapse_warmup = int(cfg.get("collapse_warmup_epochs", 3))
+    collapse_counter = 0
+    aborted = False
     log_step(
         "Training setup",
         f"seed={cfg.seed}, output_dir={outdir}, "
@@ -896,6 +945,19 @@ def train_qformer_stage1_representation(cfg):
             if item_text_loaders and (epoch + 1) % diag_every == 0:
                 run_diagnostics(epoch + 1)
 
+            if collapse_patience > 0 and (epoch + 1) >= collapse_warmup:
+                collapse_counter = {
+                    collapse_counter + 1
+                    if float(val_logs["gain_itc"]) < min_gain_itc
+                    else 0
+                }
+
+                if collapse_counter >= collapse_patience:
+                    log_step(
+                        "ABORTED - item-text objectives collapsed",
+                        f"epoch={epoch + 1}, val gain_itc={val_logs["gain_itc"]:+.3f} < {min_gain_itc} for {collapse_counter} consecutive epochs (ITC is at chance ln(n)={math.log(max(val_logs['n_item_text'], 1.0)):4f}). Check the [DIAG] query geometry line: offdiag_cos_raw near 1.0 means the representation cannot be resolved by the uncentered cosine losses. No weights exported."
+                    )
+
             improved = stopper.update(metrics)
 
             if improved:
@@ -976,7 +1038,11 @@ def train_qformer_stage1_representation(cfg):
         ),
     )
 
-    if best_checkpoint is not None:
+    if aborted:
+        log_step(
+            "Skipped best QFormer export"
+        )
+    elif best_checkpoint is not None:
         best_qformer_path = os.path.join(outdir, cfg.best_qformer_weights_name)
         torch.save(model.qformer.state_dict(), best_qformer_path)
         log_step(

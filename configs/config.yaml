@@ -312,13 +312,18 @@ run:
     # the loss at ln(n) — the mechanism behind the run where L_ui sat at ln 2
     # for 34 epochs. False = uncentered, for an A/B.
     pair_logit_center: True
+    itc_logit_center: True
+    decoupled_weight_decay: True
+    min_gain_itc: 0.05
+    collapse_patience: 3
+    collapse_warmup_epochs: 3
     # SeLLa alignment: gradients flow through the injection-identical
     # llm_align_proj (Linear+LayerNorm on out_proj output, per token, pooled
     # after projection). The head is exported and warm-starts Stage-2's
     # llm_proj — see best_align_proj_weights_name / run.qformer_stage2.proj_ckpt_in.
     w_llm: 1.0
     tau_itc: 0.07
-    tau_ii: 0.05
+    tau_ii: 0.07
     tau_ui: 0.07
     # Softer than the other contrastives: even after centering, input-space
     # targets keep residual correlation (shared genres), and tau=0.07 was
@@ -442,6 +447,7 @@ run:
     ui_cond_neg: ${run.qformer_stage1.ui_cond_neg}
     # Must match Stage 1 — the keep-alive replays the same loss.
     pair_logit_center: ${run.qformer_stage1.pair_logit_center}
+    itc_logit_center: ${run.qformer_stage1.itc_logit_center}
     qformer_ckpt_out: "qformer_stage2_best_qformer.pth"
     proj_ckpt_out: "qformer_stage2_best_proj.pth"
     output_dir: "/content/SigLLM/ckpt/qformer_stage2_qwen2/"

@@ -739,6 +739,7 @@ def train_qformer_stage2_generative(cfg):
                 item_sem_emb=sem_bank,
                 sem_dropout=sem_dropout,
                 pair_logit_center=bool(cfg.get("pair_logit_center", True)),
+                itc_logit_center=bool(cfg.get("itc_logit_center", True)),
             ).to(device)
             ui_condition_on_item = bool(qformer.user_conditioned) and w_ui_cond_keep > 0.0
             log_step(
