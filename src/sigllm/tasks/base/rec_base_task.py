@@ -91,6 +91,7 @@ class RecBaseTask:
         cuda_enabled=False,
         log_freq=50,
         accum_grad_iters=1,
+        grad_clip_norm=1.0,
     ):
         use_amp = scaler is not None
 
@@ -132,6 +133,18 @@ class RecBaseTask:
 
             # 4. Optimizer step (every accum_grad_iters)
             if (step + 1) % accum_grad_iters == 0:
+                # Gradient clipping. Adam + fp16 with NO clipping blows this run
+                # up mid-training (train loss climbs past ln 2, val AUC oscillates
+                # below 0.5) — the exact failure the Stage 1/2 trainers document
+                # and already clip against. Must unscale BEFORE clipping so the
+                # norm is measured in real (not fp16-scaled) gradient space.
+                if grad_clip_norm and grad_clip_norm > 0.0:
+                    if use_amp:
+                        scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in model.parameters() if p.requires_grad],
+                        grad_clip_norm,
+                    )
                 if use_amp:
                     scaler.step(optimizer)
                     scaler.update()

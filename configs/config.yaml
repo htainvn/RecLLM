@@ -708,6 +708,12 @@ run:
   warmup_lr: 1e-5
   weight_decay: 1e-3
   amp: True
+  # Global grad-norm clip for the Stage-3 loop (steps 1/2/3). Stage 1/2 already
+  # clip at 1.0 and both document that Adam + fp16 with NO clipping blows the
+  # run up mid-training and never recovers; the Stage-3 loop had no clip at all,
+  # which matches the observed divergence (train loss climbs past ln 2, val AUC
+  # oscillates below 0.5). 0 disables.
+  grad_clip_norm: 1.0
   # MF optimizer group defaults. Only take effect when MF is trainable, i.e.
   # tuning_step=3; steps 1/2 filter it out via requires_grad and the optimizer
   # builds the same two groups as before. The step-3 block overrides both.

@@ -147,6 +147,14 @@ class RunnerBase:
         return int(self.config.run_cfg.get("accum_grad_iters", 1))
 
     @property
+    def grad_clip_norm(self):
+        # Max global grad norm for the Stage-3 loop. Mirrors the clipping the
+        # Stage 1/2 trainers already apply (both documented that Adam + fp16
+        # with NO clipping blows the run up mid-training and never recovers).
+        # 0 (or negative) disables.
+        return float(self.config.run_cfg.get("grad_clip_norm", 1.0))
+
+    @property
     def valid_splits(self):
         valid_splits = self.config.run_cfg.get("valid_splits", [])
 
@@ -325,6 +333,7 @@ class RunnerBase:
             cuda_enabled=self.cuda_enabled,
             log_freq=self.log_freq,
             accum_grad_iters=self.accum_grad_iters,
+            grad_clip_norm=self.grad_clip_norm,
         )
 
     @torch.no_grad()
