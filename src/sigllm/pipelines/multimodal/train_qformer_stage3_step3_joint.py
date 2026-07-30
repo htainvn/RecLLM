@@ -95,15 +95,23 @@ def resolve_warm_start(cfg, slug):
 def apply_step3_overrides(cfg, slug):
     step3 = cfg.run_cfg.qformer_stage3_step3
 
-    # tuning_step MUST be set before the model is built: _init_rec_model reads
-    # it to decide whether to skip freezing MF (freezing installs a
-    # `train = disabled_train` patch that is awkward to undo afterwards).
     cfg.model_cfg.tuning_step = 3
     cfg.model_cfg.prompt_path = step3.prompt_path
-    # Redundant with the tuning_step=3 policy (which overrides it anyway) but
-    # set explicitly so `pretty_print` shows the real intent and no reader has
-    # to know about the override.
-    cfg.model_cfg.freeze_rec = False
+    # freeze_rec DECIDES whether MF joins the joint set — the step-3 policy
+    # honours it rather than overriding it, so the two independent questions stay
+    # separable:
+    #   freeze_rec=True   LoRA + Q-Former + projection co-adapt, MF held fixed.
+    #                     Answers "does the 2-step split cause the flat Step-2
+    #                     uAUC?" without moving the geometry Stage 1/2 aligned to.
+    #   freeze_rec=False  the above, plus MF. Answers the joint-MF question too,
+    #                     but then a uAUC change cannot be attributed to either.
+    # Default False here keeps the documented joint-with-MF behaviour; override
+    # with --options model.freeze_rec=True to isolate the co-adaptation effect.
+    #
+    # Must be set BEFORE the model is built: _init_rec_model reads it to decide
+    # whether to install the freeze (which patches `train = disabled_train` on
+    # the instance and is awkward to undo afterwards).
+    cfg.model_cfg.freeze_rec = bool(step3.get("freeze_rec", False))
 
     ckpt_path, source = resolve_warm_start(cfg, slug)
     cfg.model_cfg.ckpt = ckpt_path

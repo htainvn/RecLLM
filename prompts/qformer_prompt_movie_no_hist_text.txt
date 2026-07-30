@@ -1,0 +1,19 @@
+A user's collaborative taste profile is: <UserProfile>. Leverage this profile to predict whether the user would enjoy the movie titled <TargetItemTitle>. <TargetItemID> The semantic profile of this movie is: <Warm_ID> Answer with "Yes" or "No".
+A user's collaborative taste profile is: <UserProfile>. Based on this profile, predict whether the user would like the movie <TargetItemTitle>. <TargetItemID> The semantic profile of this movie is: <Warm_ID> Answer with "Yes" or "No".
+Given a user's collaborative taste profile <UserProfile>, decide whether the user would enjoy <TargetItemTitle>. <TargetItemID> The semantic profile of this movie is: <Warm_ID> Answer with "Yes" or "No"
+# Variant of qformer_prompt_movie.txt with <ItemTitleList> REMOVED.
+#
+# Purpose: the full prompt gives the model the user's history twice — once as 8
+# pooled soft tokens (<UserProfile>) and once as plain text titles
+# (<ItemTitleList>). Those are redundant, and the text path is the one Qwen2
+# already understands from pretraining, so LoRA has no reason to learn to read
+# the soft tokens. Removing the text makes <UserProfile> the ONLY route by
+# which history reaches the LLM.
+#
+# Read the result as: uAUC up  -> redundancy was the problem, soft tokens do
+# carry history; uAUC down hard -> soft tokens cannot substitute for the titles,
+# so the bottleneck is Stage 1/2 representation quality, not the prompt.
+#
+# Note <TargetItemTitle> is deliberately KEPT: this isolates ONE variable (the
+# history channel). <Warm_ID> is stripped automatically while
+# model.qformer_config.warm_token is False.

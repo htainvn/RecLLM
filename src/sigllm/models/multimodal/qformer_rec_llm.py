@@ -227,21 +227,18 @@ class QRecLLM(Rec2Base):
             self.rec_encoder.load_state_dict(torch.load(pretrained_rec, map_location="cpu"))
             log_step("Successfully loaded the pretrained model")
 
-        # Step 3 (joint tuning) trains the MF embeddings. Skip the freeze here
-        # rather than undoing it in the step policy: freezing installs a
-        # ``train = disabled_train`` patch on the instance, and an un-patch is
-        # easy to get subtly wrong (the attribute shadows the class method, so
-        # it must be deleted, not reassigned). Not applying it is exact.
-        joint_step = self.tuning_step is not None and int(self.tuning_step) == 3
-        if joint_step and freeze_rec:
-            log_step(
-                "freeze_rec OVERRIDDEN",
-                "tuning_step=3 trains MF jointly, so the configured "
-                "freeze_rec=True is ignored for the rec encoder. Set "
-                "model.freeze_rec: False explicitly to silence this.",
-            )
-
-        if freeze_rec and not joint_step and self.rec_encoder is not None:
+        # ``freeze_rec`` is the single source of truth, including at step 3.
+        # That keeps the two independent questions separable: "does LoRA +
+        # Q-Former + projection co-adapting fix the 2-step failure?" and "does
+        # letting MF move help?". Step 3 with freeze_rec=True answers the first
+        # alone; the step-3 script sets freeze_rec=False by default so the
+        # documented joint-with-MF behaviour is unchanged.
+        #
+        # Skipping the freeze (rather than undoing it later) is deliberate:
+        # freezing installs a ``train = disabled_train`` patch on the instance,
+        # and un-patching is easy to get subtly wrong — the attribute shadows the
+        # class method, so it must be deleted, not reassigned.
+        if freeze_rec and self.rec_encoder is not None:
             for name, param in self.rec_encoder.named_parameters():
                 param.requires_grad = False
             self.rec_encoder = self.rec_encoder.eval()
@@ -437,25 +434,29 @@ class QRecLLM(Rec2Base):
                     p.requires_grad = True
                 self.warm_proj.train()
 
-            # MF was left unfrozen by _init_rec_model for this step. Assert it
-            # rather than assume: a stale freeze here would train everything
-            # else and silently reduce Step 3 to Step 2 plus LoRA.
-            if self.rec_encoder is not None:
-                frozen = [n for n, p in self.rec_encoder.named_parameters() if not p.requires_grad]
-                if frozen:
-                    raise RuntimeError(
-                        "tuning_step=3 requires a trainable rec encoder but these "
-                        f"parameters are frozen: {frozen}. _init_rec_model should have "
-                        "skipped the freeze — check that model.tuning_step was set "
-                        "BEFORE the model was built (apply_step3_overrides does this)."
-                    )
+            # MF follows freeze_rec, so joint tuning comes in two flavours and
+            # the log has to say which one is running — the difference decides
+            # whether mf_drift means anything and whether the Stage-1/2
+            # alignment is being held fixed or moved underneath.
+            mf_trainable = self.rec_encoder is not None and any(
+                p.requires_grad for p in self.rec_encoder.parameters()
+            )
+            if mf_trainable:
                 self.rec_encoder.train()
                 self._snapshot_mf_weights()
 
             log_step(
                 "Tuning step 3 (JOINT)",
-                "LoRA + Q-Former + projection + warm_proj + MF trainable; base LLM frozen. "
-                "MF should use a reduced LR (run.rec_lr_scale) — watch mf_drift.",
+                "LoRA + Q-Former + projection + warm_proj trainable"
+                + (
+                    " + MF (freeze_rec=False): MF should use a reduced LR "
+                    "(run.rec_lr_scale) — watch mf_drift."
+                    if mf_trainable
+                    else " ; MF FROZEN (freeze_rec=True). This isolates the "
+                    "co-adaptation question from the joint-MF question — set "
+                    "model.freeze_rec: False to also train MF."
+                )
+                + " Base LLM frozen either way.",
             )
 
         else:

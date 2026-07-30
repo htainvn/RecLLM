@@ -134,7 +134,37 @@ datasets:
     # "his" truncation), so the Q-Former pretrains its history pooling on
     # exactly the sequence length Stage 3 feeds it. Changing this requires
     # rebuilding the qformer pkls.
-    max_history_length: 10
+    #
+    # 50, up from 10. Measured on the raw ml-1m split (real items, padding
+    # excluded): median real history is 24 on train, 38 on valid, 42 on test,
+    # with p90 = 97 / 138 / 192. At a cap of 10, 74% of train rows and 89% of
+    # test rows were truncated, and only 28% / 13% had their full history
+    # visible — <UserProfile> was pooling 10 items for users who have 24-42.
+    #
+    # Coverage (fraction of rows whose FULL history fits) vs cost:
+    #     cap  train  valid   test | tok max  slack | ui fwd  act MB
+    #      10  28.1%  16.0%  13.1% |      86    938 |   1.0x      32
+    #      40  66.1%  52.3%  48.6% |     280    744 |   4.0x     129
+    #      50  72.6%  59.5%  57.1% |     332    692 |   5.0x     161
+    #      80  85.7%  76.1%  69.5% |     495    529 |   8.0x     258
+    #     100  90.7%  82.8%  74.2% |     618    406 |  10.0x     323
+    #
+    # Prompt budget is NOT the binding constraint at any of these: <UserProfile>
+    # stays 8 POOLED soft tokens regardless of history length, so only the
+    # <ItemTitleList> text grows, and even cap 100 leaves ~406 of
+    # max_txt_len=1024 free. The headroom matters because the tokenizer
+    # truncates on the RIGHT — an overflow deletes <TargetItemTitle> and the
+    # "Answer:" cue outright rather than degrading gracefully.
+    #
+    # The binding constraint is TIME: loss_user_item runs three forwards over
+    # the [B, L] history (base + pos-conditioned + neg-conditioned), so the ui
+    # term scales linearly in the cap. Expect Stage 1 to go from ~43s to
+    # ~90-120s per epoch at 50.
+    #
+    # Note when reading the result: at 50, test coverage is still only 57%, so a
+    # FLAT uAUC does not yet prove "longer history does not help" — it would
+    # justify trying 80 (69.5% test) before concluding.
+    max_history_length: 50
     build_info:
       storage: "/content/SigLLM/data/processed/ml-1m/"
 
@@ -620,17 +650,39 @@ run:
     # everything else (optimizer schedule, warmup, batch sizes) is inherited
     # from the top-level `run.*` defaults.
     #
-    # FULL prompt, not the text-only one. CoLLM used text-only here because
-    # its soft tokens were untrained at Step 1; ours come out of Stage 2
-    # already grounded in the LLM's reading space (w_align), so they carry
-    # signal from step 0. Training LoRA WITHOUT the soft-token slots taught it
-    # to answer from <ItemTitleList>/<TargetItemTitle> alone — then Step 2
-    # froze LoRA and could only rewrite a channel the adapted model had
-    # learned to ignore (the flat Step-2 uAUC). With the full prompt, LoRA
-    # learns to READ the channel in Step 1, and Step 2 improves what is
-    # written into it. Fall back to qformer_prompt_movie_text_only.txt to
-    # reproduce the original CoLLM recipe.
-    prompt_path: "/content/SigLLM/prompts/qformer_prompt_movie.txt"
+    # HISTORY-SOFT-ONLY prompt: same as the full one but with <ItemTitleList>
+    # removed, so <UserProfile> is the ONLY route by which the user's history
+    # reaches the LLM.
+    #
+    # History of this key, because it has now been wrong in two different ways:
+    #   text_only        (CoLLM original) — no soft-token slots at all. LoRA
+    #                    learned to answer from titles; Step 2 then froze LoRA
+    #                    and could only rewrite a channel the adapted model had
+    #                    learned to ignore. Flat Step-2 uAUC.
+    #   full             (previous setting) — meant to fix that by showing LoRA
+    #                    the channel from step 0. It did not: the full prompt
+    #                    carries the history TWICE, as <UserProfile> soft tokens
+    #                    and as <ItemTitleList> text. They are redundant and the
+    #                    text path is the one Qwen2 understands from pretraining,
+    #                    so LoRA still had no reason to read the soft tokens.
+    #                    It also made Step 1 and Step 2 nearly identical — same
+    #                    prompt, same data, same loss, differing only in which
+    #                    block is trainable, i.e. block coordinate descent rather
+    #                    than a curriculum.
+    #   no_hist_text     (current) — removes the shortcut instead of hoping the
+    #                    model ignores it, the same fix that worked for the
+    #                    Stage-1 semantic-bank shortcut. <TargetItemTitle> is
+    #                    deliberately KEPT so only the history channel changes.
+    #
+    # Step 2 keeps the FULL prompt, so the two steps now differ in input as well
+    # as in trainable block: Step 1 makes LoRA read the channel, Step 2 adds the
+    # text back and refines what is written into the channel.
+    #
+    # Expect Step 1 uAUC to be interpretable either way: up means redundancy was
+    # the blocker; a large drop means the soft tokens cannot yet substitute for
+    # the titles, which points back at Stage 1/2 quality rather than the prompt.
+    # Revert with --options run.qformer_stage3_step1.prompt_path=<full prompt>.
+    prompt_path: "/content/SigLLM/prompts/qformer_prompt_movie_no_hist_text.txt"
     output_dir: "/content/SigLLM/ckpt/qformer_stage3_step1_lora_qwen2/"
     best_ckpt_name: "checkpoint_best.pth"
     init_lr: 8e-5
@@ -671,6 +723,16 @@ run:
     # trainable and the channel still noisy, LoRA learns to answer from prompt
     # text alone and the soft tokens never earn their weight.
     ckpt_from: step1
+    # Does MF join the joint set? These are two INDEPENDENT questions and mixing
+    # them makes a uAUC change unattributable:
+    #   true  -> LoRA + Q-Former + projection co-adapt, MF held FIXED. Tests
+    #            whether splitting Stage 3 into two frozen-alternating steps is
+    #            what caused the flat Step-2 uAUC, without disturbing the MF
+    #            geometry that Stage 1/2 aligned against.
+    #   false -> the above plus MF (the original joint intent). Needs
+    #            rec_lr_scale and the mf_drift diagnostic.
+    # Start with true; only add MF once co-adaptation alone has a number.
+    freeze_rec: true
     # Below step 2's 3e-5: four module groups now move at once (LoRA + Q-Former
     # + projection + MF), so the same per-module step size compounds into a
     # much larger change in the composed function.
