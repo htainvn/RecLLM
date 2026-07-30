@@ -400,6 +400,24 @@ class QFormerAlignmentBuilder(RecBaseDatasetBuilder):
             "min_positive_history": int(min_positive_history),
             "rows_before_history_filter": int(rows_before_history_filter),
             "rows_after_history_filter": int(len(df)),
+            # Real history length of the user_item samples, padding excluded.
+            # The min_positive_history filter counts len(his) INCLUDING the
+            # padding id 0, so his=[0, 10] passes a threshold of 2 while giving
+            # the Q-Former a single cross-attention key — and pooling over one
+            # key is a no-op. Record the distribution so a mostly-degenerate
+            # user_item block is visible here instead of having to be inferred
+            # from Stage 3 behaviour.
+            "user_item_his_len_mean": (
+                sum(len(s["his"]) for s in user_item_samples) / len(user_item_samples)
+                if user_item_samples
+                else 0.0
+            ),
+            "user_item_his_len_lt2_frac": (
+                sum(1 for s in user_item_samples if len(s["his"]) < 2)
+                / len(user_item_samples)
+                if user_item_samples
+                else 0.0
+            ),
             # Catalog comes from the unfiltered frame; the rows do not. A large
             # gap here is expected and is the point — it is the number of items
             # that keep appearing inside other rows' history and therefore still

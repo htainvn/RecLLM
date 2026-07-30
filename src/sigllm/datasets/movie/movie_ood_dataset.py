@@ -50,6 +50,29 @@ class MovieOODDataset(RecBaseDataset):
 				f"kept {len(df) / before:.4f} rows (min_positive_history={min_positive_history})"
 			)
 
+		# The filter above counts len(his), which INCLUDES the padding id 0, so
+		# his=[0, 10] passes min_positive_history=2 while carrying only ONE real
+		# item. That matters a lot downstream: <UserProfile> pools the history
+		# through Q-Former cross-attention, and pooling over a single key is a
+		# no-op — all the multi-source machinery Stage 1 pretrained (padded
+		# sequences, source masks, candidate-conditioned selection) does nothing
+		# for those rows. Report the REAL distribution so the gap between
+		# "passed the filter" and "has usable history" is visible rather than
+		# inferred from one prompt-preview line.
+		if "his" in df.columns and len(df):
+			real_len = df["his"].map(lambda h: sum(1 for x in h if int(x) != 0))
+			total = len(real_len)
+			log_step(
+				"History length (real items, padding excluded)",
+				f"mean={real_len.mean():.2f} median={int(real_len.median())} "
+				f"p10={int(real_len.quantile(0.10))} p90={int(real_len.quantile(0.90))} "
+				f"max={int(real_len.max())} | "
+				f"<1: {(real_len < 1).sum() / total:.1%}, "
+				f"<2: {(real_len < 2).sum() / total:.1%}, "
+				f"<5: {(real_len < 5).sum() / total:.1%} "
+				f"(a row with <2 real items makes <UserProfile> pooling a no-op)",
+			)
+
 		self.annotation = df.copy()
 
 		warm_definition = "not_cold"
