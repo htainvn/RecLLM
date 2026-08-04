@@ -116,6 +116,8 @@ class QRecLLM(Rec2Base):
         tuning_step=None,
         user_conditioned=False,
         warm_token=False,
+        direct_id_tokens=False,
+        candidate_fusion=False,
         pretrained_item_llm_emb=None,
         ranking_loss_weight=0.0,
         ranking_loss_tau=1.0,
@@ -157,9 +159,32 @@ class QRecLLM(Rec2Base):
         self.tuning_step = tuning_step
         self.user_conditioned = bool(user_conditioned)
         self.warm_token = bool(warm_token)
+        self.direct_id_tokens = bool(direct_id_tokens)
+        self.candidate_fusion = bool(candidate_fusion)
         self.embed_placeholders = list(self.PLACEHOLDERS_FOR_EMBED)
         if self.warm_token and "<Warm_ID>" not in self.embed_placeholders:
             self.embed_placeholders = ["<UserProfile>", "<Warm_ID>", "<TargetItemID>"]
+        if self.direct_id_tokens:
+            # SeLLa-style direct path, PARALLEL to the Q-Former: <UserID> and
+            # <ItemID> inject MLP(e_u) / MLP(e_i) as ONE soft token each, so
+            # the LLM sees both raw CF vectors and can in principle recover
+            # the MF dot product e_u . e_i (>= MF baseline), on top of the
+            # semantic channel.
+            for ph in ("<UserID>", "<ItemID>"):
+                if ph not in self.embed_placeholders:
+                    self.embed_placeholders.append(ph)
+            log_step(
+                "DIRECT ID TOKENS ACTIVE",
+                "<UserID> = user_id_proj(e_u), <ItemID> = item_id_proj(e_i); "
+                "1 soft token each, injected next to the Q-Former tokens.",
+            )
+        if self.candidate_fusion:
+            log_step(
+                "CANDIDATE FUSION ACTIVE",
+                "cross-attention memory slots become m_j = proj_cf(e_j) + "
+                "fuse_cf([e_t; e_j*e_t; e_j-e_t]) (+ fuse_user([e_u; e_u*e_t; "
+                "e_u-e_t])); zero-init, so warm start is a no-op.",
+            )
 
         # uAUC-aligned auxiliary losses (opt-in). ranking_loss shapes the LLM's
         # Yes/No margin; align_rank_loss shapes the aligned CF soft tokens. Both
@@ -210,9 +235,11 @@ class QRecLLM(Rec2Base):
             user_conditioned=self.user_conditioned,
             d_user=rec_config.embedding_size,
             d_sem=self.item_sem_emb.size(-1) if self.item_sem_emb is not None else None,
+            candidate_fusion=self.candidate_fusion,
         )
         self._init_projection(proj_token_num, freeze_proj, pretrained_llm_proj)
         self._init_warm_token(pretrained_item_llm_emb)
+        self._init_direct_id_proj(rec_config.embedding_size, pretrained_rec)
         self._init_prompts(prompt_path, prompt_template, max_txt_len, end_sym)
         self._apply_tuning_step_policy()
         # Built after the LLM (reads hidden_size) and after the step policy so it
@@ -356,6 +383,13 @@ class QRecLLM(Rec2Base):
         if step is None:
             return
 
+        # The direct-ID projections follow the same schedule as warm_proj:
+        # frozen at step 1 (LoRA-only), trainable at steps 2/3.
+        id_projs = [
+            m for m in (getattr(self, "user_id_proj", None), getattr(self, "item_id_proj", None))
+            if m is not None
+        ]
+
         if int(step) == 1:
             for p in self.qformer.parameters():
                 p.requires_grad = False
@@ -370,9 +404,15 @@ class QRecLLM(Rec2Base):
                     p.requires_grad = False
                 self.warm_proj.eval()
                 self.warm_proj.train = disabled_train
+            for m in id_projs:
+                for p in m.parameters():
+                    p.requires_grad = False
+                m.eval()
+                m.train = disabled_train
             log_step(
                 "Tuning step 1",
-                "LoRA trainable; Q-Former, projection, warm_proj, MF and base LLM all frozen.",
+                "LoRA trainable; Q-Former, projection, warm_proj, direct-ID projections, "
+                "MF and base LLM all frozen.",
             )
 
         elif int(step) == 2:
@@ -397,9 +437,25 @@ class QRecLLM(Rec2Base):
                 for p in self.warm_proj.parameters():
                     p.requires_grad = True
                 self.warm_proj.train()
+            for m in id_projs:
+                for p in m.parameters():
+                    p.requires_grad = True
+                m.train()
+            # MF follows freeze_rec here too (SeLLa retrains the CF embeddings
+            # jointly; freeze_rec=False in the step-2 block opts in). Snapshot
+            # for the mf_drift diagnostic exactly as step 3 does — an unfrozen
+            # MF without the drift log is flying blind.
+            mf_trainable = self.rec_encoder is not None and any(
+                p.requires_grad for p in self.rec_encoder.parameters()
+            )
+            if mf_trainable:
+                self.rec_encoder.train()
+                self._snapshot_mf_weights()
             log_step(
                 "Tuning step 2",
-                "Q-Former + projection + warm_proj trainable; LoRA, base LLM and MF frozen.",
+                "Q-Former + projection + warm_proj + direct-ID projections trainable; "
+                "LoRA, base LLM frozen; MF "
+                + ("TRAINABLE (freeze_rec=False) — watch mf_drift" if mf_trainable else "frozen"),
             )
 
         elif int(step) == 3:
@@ -423,6 +479,12 @@ class QRecLLM(Rec2Base):
                 for n, p in self.llm_model.named_parameters():
                     if "lora_" in n:
                         p.requires_grad = True
+
+            # The Q-Former stays in the joint set whenever MF is trainable, and
+            # that is not optional: Stage 1/2 taught it to read a SPECIFIC MF
+            # geometry, so if MF moves and the Q-Former is frozen, a fixed
+            # mapping is being fed a changed input. They have to move together
+            # or not at all.
             for p in self.qformer.parameters():
                 p.requires_grad = True
             self.qformer.train()
@@ -433,6 +495,10 @@ class QRecLLM(Rec2Base):
                 for p in self.warm_proj.parameters():
                     p.requires_grad = True
                 self.warm_proj.train()
+            for m in id_projs:
+                for p in m.parameters():
+                    p.requires_grad = True
+                m.train()
 
             # MF follows freeze_rec, so joint tuning comes in two flavours and
             # the log has to say which one is running — the difference decides
@@ -449,12 +515,11 @@ class QRecLLM(Rec2Base):
                 "Tuning step 3 (JOINT)",
                 "LoRA + Q-Former + projection + warm_proj trainable"
                 + (
-                    " + MF (freeze_rec=False): MF should use a reduced LR "
-                    "(run.rec_lr_scale) — watch mf_drift."
+                    " + MF (freeze_rec=False) — watch mf_drift against "
+                    "run.rec_lr_scale; if drift stays ~0 the MF arm of this "
+                    "experiment is not actually running."
                     if mf_trainable
-                    else " ; MF FROZEN (freeze_rec=True). This isolates the "
-                    "co-adaptation question from the joint-MF question — set "
-                    "model.freeze_rec: False to also train MF."
+                    else " ; MF FROZEN (freeze_rec=True)."
                 )
                 + " Base LLM frozen either way.",
             )
@@ -514,6 +579,7 @@ class QRecLLM(Rec2Base):
         user_conditioned: bool = False,
         d_user: int = None,
         d_sem: int = None,
+        candidate_fusion: bool = False,
     ):
         log_step("Loading QFormer")
         log_step(
@@ -534,6 +600,7 @@ class QRecLLM(Rec2Base):
             user_conditioned=user_conditioned,
             d_user=d_user,
             d_sem=d_sem,
+            candidate_fusion=candidate_fusion,
         ).to(self.device)
 
         if pretrained_qformer and pretrained_qformer != "not_have":
@@ -653,6 +720,63 @@ class QRecLLM(Rec2Base):
             f"<Warm_ID> injects warm_proj(e^L_item) [table={tuple(table.shape)}] into LLM embedding space. "
             f"Carries LLM semantic knowledge for cold-start items."
         )
+
+    def _init_direct_id_proj(self, d_cf, pretrained_rec):
+        """Build the SeLLa-style direct projections for <UserID> / <ItemID>.
+
+        Each is Linear(d_cf, hidden) -> GELU -> Linear(hidden, H), mirroring
+        SeLLa's ``LinearProjection``. When the pretrained MF checkpoint was
+        trained WITH the Step-2 semantic alignment (carries trans_1/trans_2),
+        both MLPs warm-start from those weights — SeLLa's
+        ``pretrained_with_small=True``, the full CL + Projection setting the
+        paper describes (the uploaded SeLLa code ships with False).
+        """
+        if not self.direct_id_tokens:
+            self.user_id_proj = None
+            self.item_id_proj = None
+            return
+
+        H = int(self.llm_model.config.hidden_size)
+
+        def build_mlp(hidden):
+            mlp = nn.Sequential(nn.Linear(d_cf, hidden), nn.GELU(), nn.Linear(hidden, H))
+            nn.init.normal_(mlp[0].weight, std=0.02)
+            nn.init.zeros_(mlp[0].bias)
+            nn.init.normal_(mlp[2].weight, std=0.02)
+            nn.init.zeros_(mlp[2].bias)
+            return mlp
+
+        hidden = 1024
+        trans_state = None
+        if pretrained_rec and pretrained_rec != "not_have" and os.path.exists(pretrained_rec):
+            mf_state = torch.load(pretrained_rec, map_location="cpu")
+            if "trans_1.weight" in mf_state and "trans_2.weight" in mf_state:
+                if int(mf_state["trans_2.weight"].shape[0]) == H:
+                    hidden = int(mf_state["trans_1.weight"].shape[0])
+                    trans_state = mf_state
+                else:
+                    log_step(
+                        "Direct ID proj: SKIPPED trans warm-start",
+                        f"MF trans_2 outputs {int(mf_state['trans_2.weight'].shape[0])} "
+                        f"dims but LLM hidden is {H} — different base LLM? "
+                        f"Falling back to fresh init.",
+                    )
+
+        self.user_id_proj = build_mlp(hidden).to(self.device)
+        self.item_id_proj = build_mlp(hidden).to(self.device)
+
+        if trans_state is not None:
+            for mlp in (self.user_id_proj, self.item_id_proj):
+                mlp[0].weight.data.copy_(trans_state["trans_1.weight"])
+                mlp[0].bias.data.copy_(trans_state["trans_1.bias"])
+                mlp[2].weight.data.copy_(trans_state["trans_2.weight"])
+                mlp[2].bias.data.copy_(trans_state["trans_2.bias"])
+            log_step(
+                "Direct ID proj warm-started from MF trans_1/trans_2",
+                f"(SeLLa pretrained_with_small=True) {d_cf}->{hidden}->{H}",
+            )
+        else:
+            log_step("Direct ID proj fresh init", f"{d_cf}->{hidden}->{H}")
 
     def _snapshot_mf_weights(self):
         """Snapshot the MF weights for the ``mf_drift`` diagnostic.
@@ -813,7 +937,7 @@ class QRecLLM(Rec2Base):
     def to_be_trained(self):
         # TEMP_DISABLED_USER_CF: old trainable placeholders included "<UserID>".
         # id_terms = ["<UserID>", "<ItemIDList>", "<TargetItemID>", "<DCNFeature>"]
-        id_terms = ["<UserProfile>", "<ItemIDList>", "<TargetItemID>", "<DCNFeature>"]
+        id_terms = ["<UserProfile>", "<ItemIDList>", "<TargetItemID>", "<DCNFeature>", "<UserID>", "<ItemID>"]
         for prompt in self.prompt_list:
             for id_term in id_terms:
                 if id_term in prompt:
@@ -904,11 +1028,28 @@ class QRecLLM(Rec2Base):
         with self.maybe_autocast():
             # Stage-2 uses the in-tree rec encoder API: direct embedding lookup from ids.
             # TEMP_DISABLED_USER_CF: old path injected a user CF token into the LLM prompt.
-            # user_cf = self.rec_encoder.user_encoder(batch_data["UserID"])          # [B,d_cf]
             user_q = None
             user_llm = None
             target_cf = self.rec_encoder.item_encoder(batch_data["TargetItemID"])  # [B,d_cf]
             target_sem = self._sem_for_items(batch_data["TargetItemID"])           # [B,d_sem] or None
+
+            # The raw user CF vector is needed by the direct <UserID> token and
+            # by the user-target fusion term; neither path goes through the
+            # Q-Former queries.
+            user_cf = None
+            if self.direct_id_tokens or self.candidate_fusion:
+                user_cf = self.rec_encoder.user_encoder(batch_data["UserID"])       # [B,d_cf]
+
+            # SeLLa-style direct path (1 token each): the LLM sees e_u and e_i
+            # unreduced, so it can in principle reconstruct the MF dot product.
+            user_id_llm = None
+            item_id_llm = None
+            if self.direct_id_tokens:
+                user_id_llm = self.user_id_proj(user_cf).unsqueeze(1)               # [B,1,H]
+                item_id_llm = self.item_id_proj(target_cf).unsqueeze(1)             # [B,1,H]
+                if self.ablate_soft_tokens:
+                    user_id_llm = torch.zeros_like(user_id_llm)
+                    item_id_llm = torch.zeros_like(item_id_llm)
 
             # Candidate conditioning (DIN-style): the TARGET item's CF vector
             # shifts the Q tokens when pooling the history below, so the same
@@ -960,10 +1101,16 @@ class QRecLLM(Rec2Base):
 
                 # Conditioned on the CANDIDATE (target_cond), not the user:
                 # this is what makes <UserProfile> vary per candidate. See the
-                # conditioning comment above target_q.
+                # conditioning comment above target_q. candidate_fusion adds
+                # the MULTIPLICATIVE variant on the memory side: each history
+                # slot carries [e_t; e_j*e_t; e_j-e_t] (zero-init, no-op at
+                # warm start), so the Q-Former reads the collaborative match
+                # between the candidate and every history item directly.
                 profile_q = self.qformer(
                     hist_cf, ins_list, user_cf=target_cond, source_mask=hist_mask,
                     sem_vec=hist_sem,
+                    fusion_target=target_cf if self.candidate_fusion else None,
+                    fusion_user=user_cf if self.candidate_fusion else None,
                 )
 
                 profile_llm = self.llm_proj(profile_q)                          # [B,Q,H]
@@ -988,6 +1135,14 @@ class QRecLLM(Rec2Base):
                 if self.warm_token and warm_llm is not None:
                     ph2emb["<Warm_ID>"] = warm_llm          # [B,1,H]
                     ph2mask["<Warm_ID>"] = torch.ones((B, 1), device=device, dtype=torch.long)
+                if self.direct_id_tokens:
+                    ones_1 = torch.ones((B, 1), device=device, dtype=torch.long)
+                    if user_id_llm is not None:
+                        ph2emb["<UserID>"] = user_id_llm    # [B,1,H]
+                        ph2mask["<UserID>"] = ones_1
+                    if item_id_llm is not None:
+                        ph2emb["<ItemID>"] = item_id_llm    # [B,1,H]
+                        ph2mask["<ItemID>"] = ones_1
 
                 merged_embeds = torch.cat([ph2emb[ph] for ph in feature_order], dim=1)    # [B, sum_slots, H]
                 full_mask = torch.cat([ph2mask[ph] for ph in feature_order], dim=1)       # [B, sum_slots]
@@ -1000,6 +1155,8 @@ class QRecLLM(Rec2Base):
                 "TargetItem_emb": target_llm,         # [B,Q,H]
                 "UserProfile_emb": profile_llm,  # [B,Q,H] or None
                 "Warm_emb": warm_llm,                  # [B,1,H] or None
+                "UserID_emb": user_id_llm,             # [B,1,H] or None (direct path)
+                "ItemID_emb": item_id_llm,             # [B,1,H] or None (direct path)
                 "merged_embs": merged_flat,             # [N,H] or None
             }
             self._log_information_flow(user_q, target_q, user_llm, target_llm, merged_flat)
@@ -1017,10 +1174,15 @@ class QRecLLM(Rec2Base):
         unk_token = self._soft_token_str
         unk_seq = " ".join([unk_token] * self.proj_token_num)
         
-        prompt_template = bos + prompt_template 
-        # TEMP_DISABLED_USER_CF: old prompt path replaced <UserID> with soft tokens.
-        # prompt_template = prompt_template.replace("<UserID>", unk_seq)
-        prompt_template = prompt_template.replace("<UserID>", "")
+        prompt_template = bos + prompt_template
+        if self.direct_id_tokens:
+            # SeLLa direct path: <UserID>/<ItemID> are ONE soft token each.
+            prompt_template = prompt_template.replace("<UserID>", unk_token)
+            prompt_template = prompt_template.replace("<ItemID>", unk_token)
+        else:
+            # TEMP_DISABLED_USER_CF: old prompt path replaced <UserID> with soft tokens.
+            prompt_template = prompt_template.replace("<UserID>", "")
+            prompt_template = prompt_template.replace("<ItemID>", "")
         prompt_template = prompt_template.replace("<TargetItemID>", unk_seq)
         prompt_template = prompt_template.replace("<UserProfile>", unk_seq)
         # prompt_template = prompt_template.replace("<DCNFeature>", unk_seq)
@@ -1122,7 +1284,12 @@ class QRecLLM(Rec2Base):
             target_soft_tokens = self.proj_token_num if "<TargetItemID>" in prompt_ori else 0
             history_soft_tokens = self.proj_token_num if "<UserProfile>" in prompt_ori else 0
             warm_soft_tokens = 1 if (self.warm_token and "<Warm_ID>" in prompt_ori) else 0
-            total_soft_tokens = target_soft_tokens + history_soft_tokens + warm_soft_tokens
+            direct_soft_tokens = 0
+            if self.direct_id_tokens:
+                direct_soft_tokens = int("<UserID>" in prompt_ori) + int("<ItemID>" in prompt_ori)
+            total_soft_tokens = (
+                target_soft_tokens + history_soft_tokens + warm_soft_tokens + direct_soft_tokens
+            )
             sample_unk_slots = int((prompts_tokens.input_ids[0] == unk_token_id).sum().item())
 
             log_step(
@@ -1473,6 +1640,8 @@ class QRecLLM(Rec2Base):
         pretrained_llm_proj = qformer_config.get("llm_proj_ckpt")
         user_conditioned = bool(qformer_config.get("user_conditioned", False))
         warm_token = bool(qformer_config.get("warm_token", False))
+        direct_id_tokens = bool(cfg.get("direct_id_tokens", False))
+        candidate_fusion = bool(qformer_config.get("candidate_fusion", False))
         pretrained_item_llm_emb = qformer_config.get("item_llm_emb_path", None)
         sem_source = bool(qformer_config.get("sem_source", False))
         item_sem_emb_path = qformer_config.get("item_sem_emb_path", None)
@@ -1524,6 +1693,8 @@ class QRecLLM(Rec2Base):
             tuning_step=tuning_step,
             user_conditioned=user_conditioned,
             warm_token=warm_token,
+            direct_id_tokens=direct_id_tokens,
+            candidate_fusion=candidate_fusion,
             pretrained_item_llm_emb=pretrained_item_llm_emb,
             ranking_loss_weight=ranking_loss_weight,
             ranking_loss_tau=ranking_loss_tau,

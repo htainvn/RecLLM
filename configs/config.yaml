@@ -11,6 +11,17 @@ model:
   freeze_rec: True
   freeze_proj: False
 
+  # SeLLa-style DIRECT ID path, parallel to the Q-Former: <UserID> and <ItemID>
+  # inject MLP(e_u) / MLP(e_i) as ONE soft token each, so the LLM sees both raw
+  # CF vectors and can in principle reconstruct the MF dot product e_u . e_i
+  # (lower-bounds the model at the MF baseline). The MLPs (d_cf->1024->GELU->H)
+  # warm-start from the MF checkpoint's trans_1/trans_2 when the MF was trained
+  # with the Step-2 semantic alignment (run.rec_baseline.item_llm_emb_path) —
+  # SeLLa's pretrained_with_small=True. Needs a prompt that carries the
+  # <UserID>/<ItemID> placeholders (qformer_prompt_movie_direct_id.txt); with a
+  # prompt that lacks them this only costs two unused projections.
+  direct_id_tokens: True
+
   # Stage 3 ablation switch. When True, target_llm and interacted_llm_flat
   # are zeroed right after llm_proj, so every soft-token slot in the prompt
   # carries a zero vector instead of the projected Q-Former output. Use this
@@ -111,6 +122,16 @@ model:
     # if the bank has all-zero rows for the items in play they are masked out
     # entirely; Stage 1 now logs covered_rows for exactly that reason.
     sem_source_dropout: 0.2
+    # Candidate-aware MULTIPLICATIVE interaction in the cross-attention MEMORY
+    # (vs user_conditioned, which shifts the QUERIES additively). Each history
+    # slot j becomes m_j = proj_cf(e_j) + fuse_cf([e_t; e_j*e_t; e_j - e_t]),
+    # plus fuse_user([e_u; e_u*e_t; e_u - e_t]) broadcast over slots. The
+    # e_j*e_t block's coordinate sum IS the MF dot product, so the Q-Former
+    # reads the collaborative match between the candidate and every history
+    # item — DIN-style target attention done by multiplication, not addition.
+    # Both fuse layers are ZERO-INITIALISED: loading a Stage-1/2 checkpoint
+    # that predates this flag is an exact no-op until training moves them.
+    candidate_fusion: True
 
   rec_config:
     user_num: 839
@@ -186,6 +207,20 @@ run:
     eval_epoch: 1
     patience: 100
     batch_size: 1024
+    # SeLLa Step 2 (semantic-aligned collaborative training). When set, MF
+    # trains with loss = BCE + align_weight * InfoNCE(tau=align_tau) between a
+    # TRAINABLE item_embedding_llm table (init from this bank) and
+    # trans_2(GELU(trans_1(e_item))) — pulling the CF item space toward the
+    # LLM semantic space BEFORE the Q-Former compresses it (256-d -> 8 tokens
+    # loses less when the two spaces are already congruent). The saved
+    # checkpoint then also carries trans_1/trans_2, which warm-start the
+    # Stage-3 direct-ID projections (model.direct_id_tokens). Uses the
+    # LAST-HIDDEN bank — same file as the warm token, dims must equal the LLM
+    # hidden size for the trans warm-start to apply. null = plain MF (BCE only).
+    item_llm_emb_path: ${model.qformer_config.item_llm_emb_path}
+    align_weight: 1.0
+    align_tau: 0.2
+    align_hidden_size: 1024
   qformer_stage1:
     # BLIP-2 representation pretraining: ITC + ITM + ITG using the Q-Former's
     # own text branch (no external BERT). Item-item contrastive (w_ii) is a
@@ -697,7 +732,11 @@ run:
     # loaded frozen from the Step 1 best checkpoint. Symmetric in shape to
     # `qformer_stage3_step1`: only the keys that differ from the top-level
     # defaults are listed here.
-    prompt_path: "/content/SigLLM/prompts/qformer_prompt_movie.txt"
+    #
+    # direct_id prompt: full prompt + the SeLLa <UserID>/<ItemID> single-token
+    # slots (see model.direct_id_tokens). Revert to qformer_prompt_movie.txt
+    # to run without the direct path.
+    prompt_path: "/content/SigLLM/prompts/qformer_prompt_movie_direct_id.txt"
     output_dir: "/content/SigLLM/ckpt/qformer_stage3_step2_cie_qwen2/"
     ckpt: "${run.qformer_stage3_step1.output_dir}${run.qformer_stage3_step1.best_ckpt_name}"
     init_lr: 3e-5
@@ -707,6 +746,16 @@ run:
     # user-conditioned trajectory (val peaks ~epoch 3, then declines as LR rises).
     min_lr: 3e-6
     max_epoch: 200
+    # SeLLa trains the CF embeddings JOINTLY at its final step; CoLLM's step 2
+    # froze them. false = MF trainable in its own optimizer param group.
+    # rec_lr_scale 3.33 * init_lr 3e-5 ~= 1e-4 for the embeddings while the
+    # Q-Former moves at 3e-5. NOTE this is deliberately faster than the step-3
+    # guidance (0.05): the semantically-aligned MF (rec_baseline alignment)
+    # is anchored to the LLM space, so it can afford to move — but watch the
+    # "MF drift" log line; rising drift with flat val uAUC means lower this.
+    freeze_rec: false
+    rec_lr_scale: 3.33
+    rec_weight_decay: 1e-4
 
   qformer_stage3_step3:
     # JOINT tuning — MF + Q-Former + projection + LoRA all trainable, base LLM

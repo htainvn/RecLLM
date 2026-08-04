@@ -61,6 +61,7 @@ class HFQFormerAdapter(nn.Module):
         user_conditioned: bool = False,
         d_user: Optional[int] = None,
         d_sem: Optional[int] = None,
+        candidate_fusion: bool = False,
     ):
         super().__init__()
 
@@ -117,6 +118,24 @@ class HFQFormerAdapter(nn.Module):
             # training signal rewards it. Standard pattern for LoRA / FiLM / prefix tuning.
             nn.init.zeros_(self.user_proj.weight)
             nn.init.zeros_(self.user_proj.bias)
+
+        # Candidate-aware MULTIPLICATIVE fusion in the cross-attention MEMORY
+        # (not the queries). For each memory slot j and target t, the slot
+        # becomes m_j = proj_cf(e_j) + fuse_cf([e_t; e_j*e_t; e_j - e_t]) —
+        # equivalent to the SeLLa-style Linear(4*d_cf -> d_model) with the
+        # last three blocks zero-initialised, but expressed additively so
+        # pre-fusion checkpoints keep loading and warm-start is an EXACT
+        # no-op. The e_j*e_t block is the point: its coordinate sum is the MF
+        # dot product, so the Q-Former can read the collaborative match
+        # between the candidate and every history item (target attention).
+        # fuse_user injects the analogous user-target interaction
+        # [e_u; e_u*e_t; e_u - e_t], broadcast over all memory slots.
+        self.candidate_fusion = bool(candidate_fusion)
+        if self.candidate_fusion:
+            self.fuse_cf = nn.Linear(3 * d_cf, d_model, bias=False)
+            nn.init.zeros_(self.fuse_cf.weight)
+            self.fuse_user = nn.Linear(3 * d_cf, d_model, bias=False)
+            nn.init.zeros_(self.fuse_user.weight)
 
         # Optional second cross-attention source: a frozen semantic (LLM-derived)
         # item embedding next to the CF vector. Attention weighs the two sources
@@ -282,7 +301,13 @@ class HFQFormerAdapter(nn.Module):
         )
         return tokens.input_ids.to(device), tokens.attention_mask.to(device)
 
-    def _project_cf(self, cf_vec: torch.Tensor, source_mask: Optional[torch.Tensor] = None):
+    def _project_cf(
+        self,
+        cf_vec: torch.Tensor,
+        source_mask: Optional[torch.Tensor] = None,
+        fusion_target: Optional[torch.Tensor] = None,
+        fusion_user: Optional[torch.Tensor] = None,
+    ):
         if cf_vec.dim() == 2:
             cf_seq = cf_vec.unsqueeze(1)
         elif cf_vec.dim() == 3:
@@ -290,6 +315,26 @@ class HFQFormerAdapter(nn.Module):
         else:
             raise ValueError(f"Expected cf_vec shape [B, d_cf] or [B, 1, d_cf], got {tuple(cf_vec.shape)}")
         encoder_hidden_states = self.proj_cf(cf_seq)
+        if self.candidate_fusion and fusion_target is not None:
+            if fusion_target.dim() != 2 or fusion_target.size(0) != cf_seq.size(0):
+                raise ValueError(
+                    f"Expected fusion_target shape [B, d_cf], got {tuple(fusion_target.shape)}"
+                )
+            target = fusion_target.unsqueeze(1).expand_as(cf_seq)                     # [B,S,d_cf]
+            encoder_hidden_states = encoder_hidden_states + self.fuse_cf(
+                torch.cat([target, cf_seq * target, cf_seq - target], dim=-1)
+            )
+            if fusion_user is not None:
+                if fusion_user.dim() != 2 or fusion_user.size(0) != cf_seq.size(0):
+                    raise ValueError(
+                        f"Expected fusion_user shape [B, d_cf], got {tuple(fusion_user.shape)}"
+                    )
+                user = fusion_user.unsqueeze(1)                                       # [B,1,d_cf]
+                target_1 = fusion_target.unsqueeze(1)
+                user_feat = self.fuse_user(
+                    torch.cat([user, user * target_1, user - target_1], dim=-1)
+                )                                                                     # [B,1,d_model]
+                encoder_hidden_states = encoder_hidden_states + user_feat
         S = encoder_hidden_states.size(1)
         if source_mask is None:
             encoder_attention_mask = torch.ones(cf_vec.size(0), S, dtype=torch.long, device=cf_vec.device)
@@ -311,6 +356,8 @@ class HFQFormerAdapter(nn.Module):
         cf_vec: torch.Tensor,
         sem_vec: Optional[torch.Tensor] = None,
         source_mask: Optional[torch.Tensor] = None,
+        fusion_target: Optional[torch.Tensor] = None,
+        fusion_user: Optional[torch.Tensor] = None,
     ):
         """Assemble the cross-attention source sequence: CF tokens first, then
         (optionally) semantic tokens aligned slot-for-slot with the CF ones.
@@ -320,7 +367,9 @@ class HFQFormerAdapter(nn.Module):
         (same ``source_mask``) AND the row is non-zero — distilled banks keep
         uncovered items at zero, so those fall back to CF-only attention.
         """
-        encoder_hidden_states, encoder_attention_mask = self._project_cf(cf_vec, source_mask)
+        encoder_hidden_states, encoder_attention_mask = self._project_cf(
+            cf_vec, source_mask, fusion_target=fusion_target, fusion_user=fusion_user
+        )
         if sem_vec is None:
             return encoder_hidden_states, encoder_attention_mask
         if self.proj_sem is None:
@@ -407,6 +456,8 @@ class HFQFormerAdapter(nn.Module):
         user_cf: Optional[torch.Tensor] = None,
         source_mask: Optional[torch.Tensor] = None,
         sem_vec: Optional[torch.Tensor] = None,
+        fusion_target: Optional[torch.Tensor] = None,
+        fusion_user: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Queries-only forward over a CF (collaborative filtering) vector.
 
@@ -422,7 +473,7 @@ class HFQFormerAdapter(nn.Module):
             batch_size, query_tokens.size(1), dtype=torch.long, device=cf_vec.device
         )
         encoder_hidden_states, encoder_attention_mask = self._project_sources(
-            cf_vec, sem_vec, source_mask
+            cf_vec, sem_vec, source_mask, fusion_target=fusion_target, fusion_user=fusion_user
         )
 
         outputs = self.qformer(
@@ -472,6 +523,8 @@ class HFQFormerAdapter(nn.Module):
         user_cf: Optional[torch.Tensor] = None,
         source_mask: Optional[torch.Tensor] = None,
         sem_vec: Optional[torch.Tensor] = None,
+        fusion_target: Optional[torch.Tensor] = None,
+        fusion_user: Optional[torch.Tensor] = None,
     ):
         """Joint forward returning ``(query_hidden, text_hidden, text_ids, text_mask)``.
 
@@ -503,7 +556,7 @@ class HFQFormerAdapter(nn.Module):
         # slots absorb attention mass proportional to the padding count, i.e.
         # leaked history length into the pooled profile token.
         encoder_hidden_states, encoder_attention_mask = self._project_sources(
-            cf_vec, sem_vec, source_mask
+            cf_vec, sem_vec, source_mask, fusion_target=fusion_target, fusion_user=fusion_user
         )
         query_attention_mask = torch.ones(
             batch_size, query_count, dtype=torch.long, device=cf_vec.device
@@ -537,6 +590,8 @@ class HFQFormerAdapter(nn.Module):
         user_cf: Optional[torch.Tensor] = None,
         source_mask: Optional[torch.Tensor] = None,
         sem_vec: Optional[torch.Tensor] = None,
+        fusion_target: Optional[torch.Tensor] = None,
+        fusion_user: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """LLM-feeding mode: queries cross-attend to ``cf_vec`` (and the
         optional ``sem_vec`` semantic source) while the text stream consumes
@@ -550,5 +605,7 @@ class HFQFormerAdapter(nn.Module):
             user_cf=user_cf,
             source_mask=source_mask,
             sem_vec=sem_vec,
+            fusion_target=fusion_target,
+            fusion_user=fusion_user,
         )
         return self.out_proj(query_hidden)

@@ -1,0 +1,16 @@
+A user's collaborative identity is <UserID> and their taste profile is: <UserProfile>. They have highly rated these movies: <ItemTitleList>. Leverage the information above to predict whether the user would enjoy the movie titled <TargetItemTitle>. <TargetItemID> <ItemID> The semantic profile of this movie is: <Warm_ID> Answer with "Yes" or "No".
+A user's collaborative identity is <UserID> and their taste profile is: <UserProfile>. They previously gave strong ratings to: <ItemTitleList>. Based on this preference history, predict whether the user would like the movie <TargetItemTitle>. <TargetItemID> <ItemID> The semantic profile of this movie is: <Warm_ID> Answer with "Yes" or "No".
+Given a user's collaborative identity <UserID>, their taste profile <UserProfile> and their highly rated movies <ItemTitleList>, decide whether the user would enjoy <TargetItemTitle>. <TargetItemID> <ItemID> The semantic profile of this movie is: <Warm_ID> Answer with "Yes" or "No"
+# Variant of qformer_prompt_movie.txt with the SeLLa-style DIRECT ID tokens.
+#
+# <UserID> injects ONE soft token user_id_proj(e_u) and <ItemID> injects ONE
+# soft token item_id_proj(e_i) (placed right next to the target's Q-Former
+# tokens), so the LLM sees BOTH raw MF vectors unreduced. In principle it can
+# then reconstruct the MF dot product e_u . e_i — i.e. this path lower-bounds
+# the model at the MF baseline, with the Q-Former semantic channel on top.
+# SeLLa injects exactly these two tokens (plus <Warm_ID>).
+#
+# Requires model.direct_id_tokens: true — with the flag off, <UserID>/<ItemID>
+# are stripped from the prompt and this file degenerates to the full prompt.
+# <Warm_ID> is stripped automatically while model.qformer_config.warm_token is
+# False.

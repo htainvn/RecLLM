@@ -153,13 +153,27 @@ def train_baseline_model(
     test_loader = DataLoader(test_data, batch_size=train_config['batch_size'], shuffle=False)
     
     # 3. Model & Optimizer Initialization
+    # SeLLa Step-2 semantic alignment (optional): when item_llm_emb_path is
+    # set, the MF trains with loss = BCE + align_weight * InfoNCE pulling the
+    # CF item space toward the LLM-distilled semantic space.
+    item_llm_emb_path = train_config.get("item_llm_emb_path", None)
+    align_weight = float(train_config.get("align_weight", 1.0))
     mf_config = omegaconf.OmegaConf.create({
         "user_num": int(user_num),
         "item_num": int(item_num),
-        "embedding_size": int(train_config['embedding_size'])
+        "embedding_size": int(train_config['embedding_size']),
+        "item_llm_emb_path": item_llm_emb_path,
+        "align_hidden_size": int(train_config.get("align_hidden_size", 1024)),
+        "align_tau": float(train_config.get("align_tau", 0.2)),
     })
 
     model = MatrixFactorization(mf_config).to(device)
+    if model.has_alignment:
+        log_step(
+            "SeLLa Step-2 alignment ACTIVE",
+            f"loss = BCE + {align_weight} * InfoNCE(tau={mf_config.align_tau}) | "
+            f"bank={item_llm_emb_path}",
+        )
     optimizer = torch.optim.Adam(model.parameters(), lr=train_config['lr'], weight_decay=train_config['wd'])
     stopper = EarlyStopping(ref_metric='valid_auc', monitor_mode='max', patience=train_config['patience'])
     criterion = nn.BCEWithLogitsLoss()
@@ -192,6 +206,8 @@ def train_baseline_model(
             
             ui_matching = model(batch_data[:, 0].long(), batch_data[:, 1].long())
             loss = criterion(ui_matching.squeeze(), batch_data[:, -1].float())
+            if model.has_alignment:
+                loss = loss + align_weight * model.alignment_loss(batch_data[:, 1].long())
 
             loss.backward()
             optimizer.step()

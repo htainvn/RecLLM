@@ -62,6 +62,15 @@ def apply_step2_overrides(cfg, slug):
     # (LR climbs 3e-5 -> 8e-5 instead of decaying). Pull the per-stage min_lr.
     cfg.run_cfg.min_lr = step2.min_lr
     cfg.run_cfg.max_epoch = step2.max_epoch
+    # SeLLa-style joint CF training at step 2 (opt-in via the step-2 block):
+    # freeze_rec=False puts the MF tables in their own optimizer param group,
+    # scaled by rec_lr_scale (see build_optimizer / common.optims).
+    if "freeze_rec" in step2:
+        cfg.model_cfg.freeze_rec = bool(step2.freeze_rec)
+    if "rec_lr_scale" in step2:
+        cfg.run_cfg.rec_lr_scale = step2.rec_lr_scale
+    if "rec_weight_decay" in step2:
+        cfg.run_cfg.rec_weight_decay = step2.rec_weight_decay
 
 
 @record
