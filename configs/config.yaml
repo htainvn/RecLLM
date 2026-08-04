@@ -136,10 +136,14 @@ model:
     #     ablations already showed doesn't move uAUC. On the target encode
     #     this slot also ends the S=1 degeneracy (when sem_source is off) and
     #     makes the 8 <TargetItemID> tokens user-aware.
-    # Both fuse layers are ZERO-INITIALISED: loading a Stage-1/2 checkpoint
-    # that predates this flag is a no-op until training moves them (fuse_cf
-    # exactly; the user slot near-exactly — its zero vector still takes a
-    # sliver of attention mass via the key bias).
+    # Warm-start safety: fuse_cf is zero-init (exact no-op). The user slot is
+    # initialised as a COPY of the target slot (proj_cf(e_t) + zero-init
+    # fuse_user residual) — duplicating a slot with identical key/value keeps
+    # the attention output EXACTLY unchanged on the S=1 target path (a
+    # zero-init slot there would grab a large share of the mass via the key
+    # bias and wreck the Stage-1/2 alignment); with sem on it double-counts
+    # the CF slot (mild), and on the history path it adds the candidate as
+    # one phantom slot among L (~1/(L+1) mass).
     candidate_fusion: True
 
   rec_config:

@@ -142,9 +142,13 @@ class HFQFormerAdapter(nn.Module):
         #    fuse_cf's input has the same defect: its contribution is
         #    slot-independent, so it cancels the same way.) As its own slot,
         #    attention can SELECT the e_u*e_t evidence — whose coordinate sum
-        #    is the MF score itself. Zero-init makes the slot a zero vector at
-        #    warm start; its key is then the cross-attention key bias, so the
-        #    warm start is near-no-op (one inert slot), not bit-exact.
+        #    is the MF score itself. The slot is initialised as a COPY of the
+        #    target's own slot, proj_cf(e_t) + zero-init fuse_user(...): a
+        #    duplicate key/value pair leaves the attention output EXACTLY
+        #    unchanged when the target is the only source (the S=1 target
+        #    path), so the warm start survives; a zero-init slot instead
+        #    would put an inert key-bias slot next to a single real slot and
+        #    grab a large share of the mass. See _project_sources.
         self.candidate_fusion = bool(candidate_fusion)
         if self.candidate_fusion:
             self.fuse_cf = nn.Linear(3 * d_cf, d_model, bias=False)
@@ -422,7 +426,21 @@ class HFQFormerAdapter(nn.Module):
                 )
             user = fusion_user.unsqueeze(1)                                       # [B,1,d_cf]
             target_1 = user_target.unsqueeze(1)                                   # [B,1,d_cf]
-            user_slot = self.fuse_user(
+            # Base the slot on proj_cf(e_t) — a COPY of the target's own slot —
+            # rather than on a zero vector. A zero slot is NOT benign: its key
+            # is the cross-attention key bias, and on the target path with
+            # sem_source off the memory is a single slot, so the inert slot
+            # would grab a large share of the attention mass at warm start and
+            # shift the <TargetItemID> tokens away from what Stage 1/2
+            # aligned. A duplicate slot with identical key/value is an EXACT
+            # no-op there (softmax splits the mass, the value sum is
+            # unchanged); with sem slots present it only double-counts the CF
+            # slot (mild, and biased toward CF rather than toward garbage);
+            # on the history path it adds the candidate itself as one
+            # meaningful phantom slot among L history slots (~1/(L+1) mass).
+            # fuse_user stays zero-init and differentiates the slot from the
+            # copy only as training rewards it.
+            user_slot = self.proj_cf(target_1) + self.fuse_user(
                 torch.cat([user, user * target_1, user - target_1], dim=-1)
             )                                                                     # [B,1,d_model]
             encoder_hidden_states = torch.cat(

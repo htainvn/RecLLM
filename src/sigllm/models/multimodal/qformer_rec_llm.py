@@ -184,9 +184,10 @@ class QRecLLM(Rec2Base):
                 "history memory slots become m_j = proj_cf(e_j) + "
                 "fuse_cf([e_t; e_j*e_t; e_j-e_t]), and BOTH the history and "
                 "target encodes get one extra selectable memory slot "
-                "fuse_user([e_u; e_u*e_t; e_u-e_t]) carrying the MF score. "
-                "Zero-init: warm start is a no-op (fuse_cf exact, user slot "
-                "near-exact).",
+                "proj_cf(e_t) + fuse_user([e_u; e_u*e_t; e_u-e_t]) carrying "
+                "the MF score. Warm start: fuse_cf zero-init (exact no-op); "
+                "the user slot starts as a COPY of the target slot, exact "
+                "no-op on the S=1 target path.",
             )
 
         # uAUC-aligned auxiliary losses (opt-in). ranking_loss shapes the LLM's
