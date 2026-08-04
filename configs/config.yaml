@@ -123,14 +123,23 @@ model:
     # entirely; Stage 1 now logs covered_rows for exactly that reason.
     sem_source_dropout: 0.2
     # Candidate-aware MULTIPLICATIVE interaction in the cross-attention MEMORY
-    # (vs user_conditioned, which shifts the QUERIES additively). Each history
-    # slot j becomes m_j = proj_cf(e_j) + fuse_cf([e_t; e_j*e_t; e_j - e_t]),
-    # plus fuse_user([e_u; e_u*e_t; e_u - e_t]) broadcast over slots. The
-    # e_j*e_t block's coordinate sum IS the MF dot product, so the Q-Former
-    # reads the collaborative match between the candidate and every history
-    # item — DIN-style target attention done by multiplication, not addition.
+    # (vs user_conditioned, which shifts the QUERIES additively). Two parts:
+    # (1) each history slot j becomes m_j = proj_cf(e_j) +
+    #     fuse_cf([e_t; e_j*e_t; e_j - e_t]) — the e_j*e_t block's coordinate
+    #     sum IS the MF dot product, so the Q-Former reads the collaborative
+    #     match between the candidate and every history item (DIN-style
+    #     target attention by multiplication, not addition);
+    # (2) ONE extra SELECTABLE memory slot fuse_user([e_u; e_u*e_t; e_u-e_t])
+    #     appended to BOTH the history and the target encodes. A slot, not a
+    #     broadcast: adding the same vector to every key/value cancels in
+    #     softmax and degenerates to an output bias — the additive shift the
+    #     ablations already showed doesn't move uAUC. On the target encode
+    #     this slot also ends the S=1 degeneracy (when sem_source is off) and
+    #     makes the 8 <TargetItemID> tokens user-aware.
     # Both fuse layers are ZERO-INITIALISED: loading a Stage-1/2 checkpoint
-    # that predates this flag is an exact no-op until training moves them.
+    # that predates this flag is a no-op until training moves them (fuse_cf
+    # exactly; the user slot near-exactly — its zero vector still takes a
+    # sliver of attention mass via the key bias).
     candidate_fusion: True
 
   rec_config:
@@ -138,6 +147,16 @@ model:
     item_num: 3256
     embedding_size: 256
     pretrained_path: "/content/SigLLM/ckpt/mf/mf_model.pth"
+    # Build the Stage-3 MF WITH the SeLLa Step-2 alignment modules so the
+    # TRAINED item_embedding_llm / trans_1 / trans_2 from the MF checkpoint
+    # load instead of being dropped by the variant-reconciling
+    # load_state_dict. <Warm_ID> then reads the trained table (live module,
+    # trainable under freeze_rec=False) instead of the raw distilled bank.
+    # The bank file is only used to SHAPE the init before the checkpoint
+    # overwrites it. Set null to build a plain 2-table MF.
+    item_llm_emb_path: ${model.qformer_config.item_llm_emb_path}
+    align_hidden_size: 1024
+    align_tau: 0.2
 
   # Warm-init checkpoint. Step 2 overrides this with the Step 1 LoRA ckpt;
   # Step 1 overrides it to null. Leave null at top level so a bare config
@@ -217,6 +236,14 @@ run:
     # Stage-3 direct-ID projections (model.direct_id_tokens). Uses the
     # LAST-HIDDEN bank — same file as the warm token, dims must equal the LLM
     # hidden size for the trans warm-start to apply. null = plain MF (BCE only).
+    #
+    # BOOTSTRAP ORDER (the bank is produced by distill_item_llm_embeddings.py,
+    # so on a fresh setup distill BEFORE training this MF — the distill script
+    # no longer needs mf_model.pth on any of its paths):
+    #   base-LLM bank:   distill (base LLM) -> MF(align) -> stages.
+    #   SeLLa parity     plain MF (item_llm_emb_path=null) -> step-1 LoRA ->
+    #   (bank from the   distill (--rec-ckpt / --lora-adapter-dir) ->
+    #   finetuned LLM):  re-train MF with alignment -> rerun stages.
     item_llm_emb_path: ${model.qformer_config.item_llm_emb_path}
     align_weight: 1.0
     align_tau: 0.2

@@ -170,6 +170,17 @@ def _load_finetuned_recllm(args):
         model_cfg.qformer_config.warm_token = False
         model_cfg.qformer_config.item_llm_emb_path = None
 
+    # Break the bootstrap cycle: this script PRODUCES item_llm_emb.pt, but the
+    # semantically-aligned MF (run.rec_baseline.item_llm_emb_path) CONSUMES it,
+    # so on a fresh setup neither mf_model.pth nor the bank exists yet when
+    # distilling. Only model.llm_model / model.llm_tokenizer are used here —
+    # the MF weights and the alignment bank are irrelevant to distillation —
+    # so skip loading both instead of requiring them.
+    if model_cfg.get("rec_config") is not None:
+        model_cfg.rec_config.pretrained_path = "not_have"
+        if model_cfg.rec_config.get("item_llm_emb_path") is not None:
+            model_cfg.rec_config.item_llm_emb_path = None
+
     step1 = cfg.run_cfg.get("qformer_stage3_step1") if cfg.run_cfg is not None else None
     if step1 is not None and step1.get("prompt_path"):
         model_cfg.prompt_path = step1.prompt_path

@@ -175,15 +175,18 @@ class QRecLLM(Rec2Base):
                     self.embed_placeholders.append(ph)
             log_step(
                 "DIRECT ID TOKENS ACTIVE",
-                "<UserID> = user_id_proj(e_u), <ItemID> = item_id_proj(e_i); "
+                "<UserID> = id_proj(e_u), <ItemID> = id_proj(e_i) (shared MLP, SeLLa parity); "
                 "1 soft token each, injected next to the Q-Former tokens.",
             )
         if self.candidate_fusion:
             log_step(
                 "CANDIDATE FUSION ACTIVE",
-                "cross-attention memory slots become m_j = proj_cf(e_j) + "
-                "fuse_cf([e_t; e_j*e_t; e_j-e_t]) (+ fuse_user([e_u; e_u*e_t; "
-                "e_u-e_t])); zero-init, so warm start is a no-op.",
+                "history memory slots become m_j = proj_cf(e_j) + "
+                "fuse_cf([e_t; e_j*e_t; e_j-e_t]), and BOTH the history and "
+                "target encodes get one extra selectable memory slot "
+                "fuse_user([e_u; e_u*e_t; e_u-e_t]) carrying the MF score. "
+                "Zero-init: warm start is a no-op (fuse_cf exact, user slot "
+                "near-exact).",
             )
 
         # uAUC-aligned auxiliary losses (opt-in). ranking_loss shapes the LLM's
@@ -383,12 +386,9 @@ class QRecLLM(Rec2Base):
         if step is None:
             return
 
-        # The direct-ID projections follow the same schedule as warm_proj:
+        # The direct-ID projection follows the same schedule as warm_proj:
         # frozen at step 1 (LoRA-only), trainable at steps 2/3.
-        id_projs = [
-            m for m in (getattr(self, "user_id_proj", None), getattr(self, "item_id_proj", None))
-            if m is not None
-        ]
+        id_projs = [m for m in (getattr(self, "id_proj", None),) if m is not None]
 
         if int(step) == 1:
             for p in self.qformer.parameters():
@@ -693,58 +693,82 @@ class QRecLLM(Rec2Base):
                 f"d_q={d_q}, H={H}, Q={self.proj_token_num}")
 
     def _init_warm_token(self, pretrained_item_llm_emb):
+        self.warm_from_rec = False
         if not self.warm_token:
             self.item_llm_emb = None
             self.warm_proj = None
             return
 
-        if not pretrained_item_llm_emb or not os.path.exists(pretrained_item_llm_emb):
-            raise FileNotFoundError(f"warm_token=True but pretrained_item_llm_emb not found: {pretrained_item_llm_emb}")
-
         H = int(self.llm_model.config.hidden_size)
-        blob = torch.load(pretrained_item_llm_emb, map_location="cpu")
-        table = blob["item_llm_emb"] if isinstance(blob, dict) else blob
-        table = table.float()
 
-        if table.size(-1) != H:
-            raise ValueError(f"pretrained_item_llm_emb has hidden size {table.size(-1)}, expected {H}")
+        # Prefer the MF's TRAINED item_embedding_llm table over the raw
+        # distilled bank: when the MF was trained with the SeLLa Step-2
+        # alignment (rec_config.item_llm_emb_path), that table started from
+        # the bank and was then trained jointly with the InfoNCE — falling
+        # back to the raw file would throw that training away. Reading the
+        # live module also means the table stays trainable at steps where
+        # freeze_rec=False, matching SeLLa's trainable <Warm_ID> source.
+        rec_table = getattr(self.rec_encoder, "item_embedding_llm", None)
+        if rec_table is not None and int(rec_table.weight.size(-1)) == H:
+            self.warm_from_rec = True
+            self.item_llm_emb = None
+            table_shape = tuple(rec_table.weight.shape)
+            source_msg = "rec_encoder.item_embedding_llm (SeLLa Step-2 trained, live module)"
+        else:
+            if rec_table is not None:
+                log_step(
+                    "Warm token: rec_encoder.item_embedding_llm dim "
+                    f"{int(rec_table.weight.size(-1))} != LLM hidden {H}",
+                    "falling back to the raw distilled bank.",
+                )
+            if not pretrained_item_llm_emb or not os.path.exists(pretrained_item_llm_emb):
+                raise FileNotFoundError(f"warm_token=True but pretrained_item_llm_emb not found: {pretrained_item_llm_emb}")
 
-        self.register_buffer("item_llm_emb", table.to(self.device), persistent=False)
+            blob = torch.load(pretrained_item_llm_emb, map_location="cpu")
+            table = blob["item_llm_emb"] if isinstance(blob, dict) else blob
+            table = table.float()
+
+            if table.size(-1) != H:
+                raise ValueError(f"pretrained_item_llm_emb has hidden size {table.size(-1)}, expected {H}")
+
+            self.register_buffer("item_llm_emb", table.to(self.device), persistent=False)
+            table_shape = tuple(table.shape)
+            source_msg = f"raw bank {pretrained_item_llm_emb} (frozen buffer)"
+
         self.warm_proj = nn.Sequential(nn.Linear(H, H), nn.LayerNorm(H)).to(self.device)
         nn.init.normal_(self.warm_proj[0].weight, std=0.02)
         nn.init.zeros_(self.warm_proj[0].bias)
         nn.init.constant_(self.warm_proj[1].weight, H ** -0.5)
         nn.init.zeros_(self.warm_proj[1].bias)
         log_step(
-            "Warm token active", 
-            f"<Warm_ID> injects warm_proj(e^L_item) [table={tuple(table.shape)}] into LLM embedding space. "
-            f"Carries LLM semantic knowledge for cold-start items."
+            "Warm token active",
+            f"<Warm_ID> injects warm_proj(e^L_item) [table={table_shape}, source={source_msg}] "
+            f"into LLM embedding space. Carries LLM semantic knowledge for cold-start items."
         )
 
-    def _init_direct_id_proj(self, d_cf, pretrained_rec):
-        """Build the SeLLa-style direct projections for <UserID> / <ItemID>.
+    def _warm_table_rows(self, item_ids):
+        """Rows of the warm-token source table for ``item_ids``."""
+        if self.warm_from_rec:
+            return self.rec_encoder.item_embedding_llm(item_ids)
+        return self.item_llm_emb[item_ids]
 
-        Each is Linear(d_cf, hidden) -> GELU -> Linear(hidden, H), mirroring
-        SeLLa's ``LinearProjection``. When the pretrained MF checkpoint was
+    def _init_direct_id_proj(self, d_cf, pretrained_rec):
+        """Build the SeLLa-style direct projection for <UserID> / <ItemID>.
+
+        ONE SHARED MLP Linear(d_cf, hidden) -> GELU -> Linear(hidden, H) for
+        both tokens, mirroring SeLLa's ``LinearProjection`` (its
+        ``prepare_collm_prompt`` runs user and item embeddings through the
+        same ``projection_model``). When the pretrained MF checkpoint was
         trained WITH the Step-2 semantic alignment (carries trans_1/trans_2),
-        both MLPs warm-start from those weights — SeLLa's
+        the MLP warm-starts from those weights — SeLLa's
         ``pretrained_with_small=True``, the full CL + Projection setting the
         paper describes (the uploaded SeLLa code ships with False).
         """
         if not self.direct_id_tokens:
-            self.user_id_proj = None
-            self.item_id_proj = None
+            self.id_proj = None
             return
 
         H = int(self.llm_model.config.hidden_size)
-
-        def build_mlp(hidden):
-            mlp = nn.Sequential(nn.Linear(d_cf, hidden), nn.GELU(), nn.Linear(hidden, H))
-            nn.init.normal_(mlp[0].weight, std=0.02)
-            nn.init.zeros_(mlp[0].bias)
-            nn.init.normal_(mlp[2].weight, std=0.02)
-            nn.init.zeros_(mlp[2].bias)
-            return mlp
 
         hidden = 1024
         trans_state = None
@@ -762,21 +786,24 @@ class QRecLLM(Rec2Base):
                         f"Falling back to fresh init.",
                     )
 
-        self.user_id_proj = build_mlp(hidden).to(self.device)
-        self.item_id_proj = build_mlp(hidden).to(self.device)
+        self.id_proj = nn.Sequential(nn.Linear(d_cf, hidden), nn.GELU(), nn.Linear(hidden, H))
+        nn.init.normal_(self.id_proj[0].weight, std=0.02)
+        nn.init.zeros_(self.id_proj[0].bias)
+        nn.init.normal_(self.id_proj[2].weight, std=0.02)
+        nn.init.zeros_(self.id_proj[2].bias)
+        self.id_proj = self.id_proj.to(self.device)
 
         if trans_state is not None:
-            for mlp in (self.user_id_proj, self.item_id_proj):
-                mlp[0].weight.data.copy_(trans_state["trans_1.weight"])
-                mlp[0].bias.data.copy_(trans_state["trans_1.bias"])
-                mlp[2].weight.data.copy_(trans_state["trans_2.weight"])
-                mlp[2].bias.data.copy_(trans_state["trans_2.bias"])
+            self.id_proj[0].weight.data.copy_(trans_state["trans_1.weight"])
+            self.id_proj[0].bias.data.copy_(trans_state["trans_1.bias"])
+            self.id_proj[2].weight.data.copy_(trans_state["trans_2.weight"])
+            self.id_proj[2].bias.data.copy_(trans_state["trans_2.bias"])
             log_step(
-                "Direct ID proj warm-started from MF trans_1/trans_2",
+                "Direct ID proj (shared) warm-started from MF trans_1/trans_2",
                 f"(SeLLa pretrained_with_small=True) {d_cf}->{hidden}->{H}",
             )
         else:
-            log_step("Direct ID proj fresh init", f"{d_cf}->{hidden}->{H}")
+            log_step("Direct ID proj (shared) fresh init", f"{d_cf}->{hidden}->{H}")
 
     def _snapshot_mf_weights(self):
         """Snapshot the MF weights for the ``mf_drift`` diagnostic.
@@ -1040,13 +1067,14 @@ class QRecLLM(Rec2Base):
             if self.direct_id_tokens or self.candidate_fusion:
                 user_cf = self.rec_encoder.user_encoder(batch_data["UserID"])       # [B,d_cf]
 
-            # SeLLa-style direct path (1 token each): the LLM sees e_u and e_i
-            # unreduced, so it can in principle reconstruct the MF dot product.
+            # SeLLa-style direct path (1 token each, SHARED MLP like SeLLa's
+            # LinearProjection): the LLM sees e_u and e_i unreduced, so it can
+            # in principle reconstruct the MF dot product.
             user_id_llm = None
             item_id_llm = None
             if self.direct_id_tokens:
-                user_id_llm = self.user_id_proj(user_cf).unsqueeze(1)               # [B,1,H]
-                item_id_llm = self.item_id_proj(target_cf).unsqueeze(1)             # [B,1,H]
+                user_id_llm = self.id_proj(user_cf).unsqueeze(1)                    # [B,1,H]
+                item_id_llm = self.id_proj(target_cf).unsqueeze(1)                  # [B,1,H]
                 if self.ablate_soft_tokens:
                     user_id_llm = torch.zeros_like(user_id_llm)
                     item_id_llm = torch.zeros_like(item_id_llm)
@@ -1059,10 +1087,19 @@ class QRecLLM(Rec2Base):
             target_cond = target_cf if self.user_conditioned else None
 
             # 2) QFormer outputs (instruction-conditioned). The target encode is
-            # NOT conditioned on itself; its candidate signal already enters as
-            # the cross-attention source.
+            # NOT conditioned on itself (no fusion_target -> no per-slot
+            # fuse_cf on its own slot), but it DOES get the user-target slot
+            # (slot_target): without it the target memory is a single item
+            # slot when sem_vec is None (cross-attention degenerates to a
+            # constant read) and the 8 <TargetItemID> tokens — nearly half the
+            # soft-token bandwidth — carry pure item identity with no idea who
+            # the user is. The slot's e_u*e_t block sums to the MF score.
             # user_q = self.qformer(user_cf, ins_list)        # [B,Q,d_model]
-            target_q = self.qformer(target_cf, ins_list, sem_vec=target_sem)  # [B,Q,d_model]
+            target_q = self.qformer(
+                target_cf, ins_list, sem_vec=target_sem,
+                fusion_user=user_cf if self.candidate_fusion else None,
+                slot_target=target_cf if self.candidate_fusion else None,
+            )  # [B,Q,d_model]
 
             # 3) Project to LLM hidden per token
             # user_llm = self.llm_proj(user_q)               # [B,Q,H]
@@ -1073,7 +1110,7 @@ class QRecLLM(Rec2Base):
 
             warm_llm = None
             if self.warm_token and self.warm_proj is not None:
-                warm_cf = self.item_llm_emb[batch_data["TargetItemID"]]  # [B,H]
+                warm_cf = self._warm_table_rows(batch_data["TargetItemID"])  # [B,H]
                 warm_llm = self.warm_proj(warm_cf).unsqueeze(1)
                 if self.ablate_soft_tokens:
                     warm_llm = torch.zeros_like(warm_llm)
