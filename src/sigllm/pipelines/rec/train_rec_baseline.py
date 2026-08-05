@@ -200,19 +200,36 @@ def train_baseline_model(
     #5. Training loop
     for epoch in range(train_config['epoch']):
         model.train()
+        epoch_rec_loss, epoch_cl_loss, epoch_batches = 0.0, 0.0, 0
         for batch_data in train_loader:
             batch_data = batch_data.to(device)
             optimizer.zero_grad()
-            
+
             ui_matching = model(batch_data[:, 0].long(), batch_data[:, 1].long())
             loss = criterion(ui_matching.squeeze(), batch_data[:, -1].float())
+            epoch_rec_loss += loss.item()
             if model.has_alignment:
-                loss = loss + align_weight * model.alignment_loss(batch_data[:, 1].long())
+                cl_loss = model.alignment_loss(batch_data[:, 1].long())
+                epoch_cl_loss += cl_loss.item()
+                loss = loss + align_weight * cl_loss
+            epoch_batches += 1
 
             loss.backward()
             optimizer.step()
 
         if epoch % train_config['eval_epoch'] == 0:
+            # Both components, so an alignment term drowning the BCE is
+            # visible instead of showing up only as a flat AUC. loss_rec
+            # should fall like a plain-MF run; if it doesn't while cl moves,
+            # lower align_weight.
+            if epoch_batches:
+                detail = f"loss_rec={epoch_rec_loss / epoch_batches:.4f}"
+                if model.has_alignment:
+                    detail += (
+                        f", cl_loss={epoch_cl_loss / epoch_batches:.4f}"
+                        f" (weighted x{align_weight})"
+                    )
+                log_step(f"Epoch {epoch} train loss", detail)
             v_users, v_preds, v_labels = get_model_predictions(model, valid_loader, device)
             valid_auc = roc_auc_score(v_labels, v_preds)
             valid_uauc, _, _ = calculate_user_auc(v_users, v_preds, v_labels)
@@ -234,7 +251,13 @@ def train_baseline_model(
             improved = stopper.update(metrics)
 
             if improved:
-                log_step(f"New best model found at epoch {epoch} with Valid uAUC: {valid_uauc:.4f}")
+                # The stopper monitors valid_auc — say so. The old message
+                # printed uAUC, which made a save after a lower-uAUC epoch
+                # look like a selection bug (AUC had improved, uAUC hadn't).
+                log_step(
+                    f"New best model found at epoch {epoch} "
+                    f"(monitored valid_auc: {valid_auc:.4f}; uAUC at this epoch: {valid_uauc:.4f})"
+                )
                 if save_file is not None:
                     torch.save(model.state_dict(), save_file)
                     log_step(f"Model saved to {save_file}")
