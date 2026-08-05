@@ -138,6 +138,12 @@ def _init_qformer(cfg, device, d_sem=None):
         user_conditioned=bool(cfg.get("user_conditioned", False)),
         # Must mirror model.qformer_config.* — these change the adapter SHAPE,
         # and the checkpoint flows stage1 -> stage2 -> stage3 under a strict load.
+        # Q-Former internal dropout (hidden + attention). Was hardcoded 0.0 by
+        # omission: no call site passed it, so a 3-layer transformer trained on
+        # ~17k user_item pairs had no regularisation at all, which is the
+        # straightforward reading of train g_ui >0.67 against val ~0.14.
+        # Does NOT change the state_dict, so checkpoints stay compatible.
+        dropout=float(cfg.get("qformer_dropout", 0.0)),
         candidate_fusion=bool(cfg.get("candidate_fusion", False)),
         item_residual=bool(cfg.get("item_residual", False)),
         d_user=int(cfg.embedding_size),

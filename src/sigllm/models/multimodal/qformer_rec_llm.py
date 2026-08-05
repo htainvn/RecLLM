@@ -123,6 +123,7 @@ class QRecLLM(Rec2Base):
         direct_id_tokens=False,
         candidate_fusion=False,
         item_residual=False,
+        qformer_dropout=0.0,
         center_soft_tokens=True,
         pretrained_item_llm_emb=None,
         ranking_loss_weight=0.0,
@@ -249,6 +250,7 @@ class QRecLLM(Rec2Base):
             d_sem=self.item_sem_emb.size(-1) if self.item_sem_emb is not None else None,
             candidate_fusion=self.candidate_fusion,
             item_residual=self.item_residual,
+            qformer_dropout=qformer_dropout,
         )
         self._init_projection(proj_token_num, freeze_proj, pretrained_llm_proj)
         self._init_warm_token(pretrained_item_llm_emb)
@@ -591,6 +593,7 @@ class QRecLLM(Rec2Base):
         d_sem: int = None,
         candidate_fusion: bool = False,
         item_residual: bool = False,
+        qformer_dropout: float = 0.0,
     ):
         log_step("Loading QFormer")
         log_step(
@@ -611,6 +614,7 @@ class QRecLLM(Rec2Base):
             user_conditioned=user_conditioned,
             d_user=d_user,
             d_sem=d_sem,
+            dropout=qformer_dropout,
             candidate_fusion=candidate_fusion,
             item_residual=item_residual,
         ).to(self.device)
@@ -1772,6 +1776,7 @@ class QRecLLM(Rec2Base):
         direct_id_tokens = bool(cfg.get("direct_id_tokens", False))
         candidate_fusion = bool(qformer_config.get("candidate_fusion", False))
         item_residual = bool(qformer_config.get("item_residual", False))
+        qformer_dropout = float(qformer_config.get("qformer_dropout", 0.0))
         center_soft_tokens = bool(qformer_config.get("center_soft_tokens", True))
         pretrained_item_llm_emb = qformer_config.get("item_llm_emb_path", None)
         sem_source = bool(qformer_config.get("sem_source", False))
@@ -1827,6 +1832,7 @@ class QRecLLM(Rec2Base):
             direct_id_tokens=direct_id_tokens,
             candidate_fusion=candidate_fusion,
             item_residual=item_residual,
+            qformer_dropout=qformer_dropout,
             center_soft_tokens=center_soft_tokens,
             pretrained_item_llm_emb=pretrained_item_llm_emb,
             ranking_loss_weight=ranking_loss_weight,

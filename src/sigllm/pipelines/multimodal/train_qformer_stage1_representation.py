@@ -90,6 +90,12 @@ def _init_qformer(cfg, d_model, device, d_sem=None):
         user_conditioned=bool(cfg.get("user_conditioned", False)),
         # Must mirror model.qformer_config.* — these change the adapter SHAPE,
         # and the checkpoint flows stage1 -> stage2 -> stage3 under a strict load.
+        # Q-Former internal dropout (hidden + attention). Was hardcoded 0.0 by
+        # omission: no call site passed it, so a 3-layer transformer trained on
+        # ~17k user_item pairs had no regularisation at all, which is the
+        # straightforward reading of train g_ui >0.67 against val ~0.14.
+        # Does NOT change the state_dict, so checkpoints stay compatible.
+        dropout=float(cfg.get("qformer_dropout", 0.0)),
         candidate_fusion=bool(cfg.get("candidate_fusion", False)),
         item_residual=bool(cfg.get("item_residual", False)),
         d_user=int(cfg.embedding_size),
@@ -160,11 +166,20 @@ def _zero_init_path_norms(model):
     qformer = getattr(model, "qformer", None)
     if qformer is None:
         return out
-    for name in ("proj_sem", "user_proj"):
+    # item_res_proj / fuse_cf / fuse_user are the newer zero-init paths and are
+    # exactly as prone to staying inert as the older two — item_res_proj is the
+    # residual injection meant to bypass the body's ~45x attenuation of the
+    # item-specific component, and fuse_* carry the candidate interaction, so
+    # "did it leave 0" is the whole question for all three. fuse_cf/fuse_user
+    # are built with bias=False, hence the None guard.
+    for name in ("proj_sem", "user_proj", "item_res_proj", "fuse_cf", "fuse_user"):
         module = getattr(qformer, name, None)
-        if module is not None:
-            out[name] = float(module.weight.detach().norm().item())
-            out[f"{name}_bias"] = float(module.bias.detach().norm().item())
+        if module is None:
+            continue
+        out[name] = float(module.weight.detach().norm().item())
+        bias = getattr(module, "bias", None)
+        if bias is not None:
+            out[f"{name}_bias"] = float(bias.detach().norm().item())
     return out
 
 

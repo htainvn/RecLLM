@@ -179,6 +179,16 @@ model:
     # the SOURCE being read. Zero-init, so warm start is an exact no-op.
     item_residual: True
 
+    # Q-Former internal dropout (hidden + attention). Was effectively 0.0 by
+    # omission — no call site ever passed `dropout` to HFQFormerAdapter, so a
+    # 3-layer transformer trained on ~17k user_item pairs ran with NO
+    # regularisation. That is the straightforward reading of the observed gap:
+    # train g_ui >0.67 (above the +0.497 raw-MF ceiling, i.e. memorising) while
+    # val g_ui sticks at ~0.14. Distinct from sem_source_dropout, which drops
+    # whole rows of the semantic bank.
+    # Does NOT change the state_dict, so existing checkpoints stay loadable.
+    qformer_dropout: 0.1
+
     # Remove the direction shared across items from the soft tokens, before the
     # LayerNorm that scales them for injection (llm_proj becomes
     # Linear -> SharedDirectionCenter -> LayerNorm; a running mean tracked per
@@ -689,6 +699,7 @@ run:
     # and these add/remove modules (fuse_cf, fuse_user, item_res_proj).
     candidate_fusion: ${model.qformer_config.candidate_fusion}
     item_residual: ${model.qformer_config.item_residual}
+    qformer_dropout: ${model.qformer_config.qformer_dropout}
     # Semantic second cross-attention source (reuses item_llm_emb_path below).
     sem_source: ${model.qformer_config.sem_source}
     sem_source_dropout: ${model.qformer_config.sem_source_dropout}
@@ -805,6 +816,7 @@ run:
     # and these add/remove modules (fuse_cf, fuse_user, item_res_proj).
     candidate_fusion: ${model.qformer_config.candidate_fusion}
     item_residual: ${model.qformer_config.item_residual}
+    qformer_dropout: ${model.qformer_config.qformer_dropout}
     # Must match Stage 1 and Stage 3 — llm_proj is warm-started from Stage 1's
     # llm_align_proj here and exported to Stage 3 under a strict load.
     center_soft_tokens: ${model.qformer_config.center_soft_tokens}
