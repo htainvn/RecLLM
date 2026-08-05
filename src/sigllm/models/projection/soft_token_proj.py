@@ -112,7 +112,15 @@ class SharedDirectionCenter(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.training:
             self._update(x)
-        mean = self.running_mean
+        # clone(), because ``running_mean`` is mutated IN PLACE above and one
+        # training step runs this module several times (target tokens, then the
+        # pooled-history tokens). A detached view shares the version counter, so a
+        # later in-place update can invalidate what an earlier forward's backward
+        # saved — the "[1] is at version 15; expected 13" crash the residual's
+        # divisor hit. Subtraction happens not to save its operands (d/dx = 1), so
+        # this path has not failed in practice; cloning is cheap insurance against
+        # that detail changing, and against a crash surfacing mid-run.
+        mean = self.running_mean.clone()
         if self.num_positions and not (x.dim() >= 2 and x.size(-2) == self.num_positions):
             mean = mean.mean(0)
         return x - mean.to(dtype=x.dtype, device=x.device)

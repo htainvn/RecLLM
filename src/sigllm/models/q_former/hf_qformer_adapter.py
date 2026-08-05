@@ -672,11 +672,20 @@ class HFQFormerAdapter(nn.Module):
         # ranking signal lives.
         with torch.no_grad():
             batch_norm = res.detach().float().norm(dim=-1).mean().clamp(min=1e-6)
-            if self.res_norm_ema.item() <= 0:
+            if float(self.res_norm_ema) <= 0:
                 self.res_norm_ema.fill_(batch_norm)
             elif self.training:
                 self.res_norm_ema.mul_(0.99).add_(batch_norm, alpha=0.01)
-        res = res / self.res_norm_ema.to(res.dtype) * self.res_gain
+            # CLONE, not detach: the buffer is mutated in place above, and one
+            # training step runs several adapter forwards (L_ii, L_ui, L_rank,
+            # ...). A detached view SHARES the version counter, so the next
+            # forward's in-place update invalidates the value the previous
+            # forward's backward saved -> "variable needed for gradient
+            # computation has been modified by an inplace operation ... [1] is at
+            # version 15; expected version 13". clone() gives the division its own
+            # tensor with its own version counter.
+            scale = self.res_norm_ema.clone()
+        res = res / scale.to(res.dtype) * self.res_gain
         return query_hidden + res.unsqueeze(1).to(query_hidden.dtype)
 
     def encode_cf(
