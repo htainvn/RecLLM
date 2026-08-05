@@ -313,7 +313,7 @@ datasets:
     # `python src/sigllm/pipelines/multimodal/build_qformer_dataset.py
     #  --cfg-path configs/config.yaml` first, or Stage 1 pretrains the history
     # pooling on length 50 while Stage 3 feeds it 40.
-    max_history_length: 30
+    max_history_length: 10
     build_info:
       storage: "/content/SigLLM/data/processed/ml-1m/"
 
