@@ -32,11 +32,12 @@ B) The SAME InfoNCE Stage 1 runs for L_ii / L_ui, computed directly on RAW MF
        raw gain ~ 0               -> co-watch is not linearly readable from the
                                      MF geometry at all; fix the MF first
 
-   Each is also reported CENTERED (batch mean removed before the cosine),
-   because config documents the residual as near low-rank and centering was
-   only ever measured at tau=0.07, where bipolar cosines x 1/tau blow the
-   logsumexp up. If ``centered`` is much better here, ``pair_logit_center=True``
-   with a RAISED tau is the cheap fix — that combination has never been run.
+   Each is swept over (center, tau). Read ``top1``, NOT ``gain``: simulation
+   shows gain pins at ~0 both when the ordering is PERFECT (isotropic residual,
+   top1 1.000) and when it is weak (low-rank residual, top1 0.156), so gain
+   alone cannot tell "no signal" from "dead margin". See ``report`` for the
+   table and for why neither centering nor a raised tau is the free win it
+   looks like.
 
 C) Not implemented here: ``probe_cf_channel.py`` already answers "does the
    whole channel out-rank MF". Run it alongside this (see Usage).
@@ -61,7 +62,6 @@ Usage
 
 import argparse
 import math
-import pickle
 
 import torch
 import torch.nn.functional as F
@@ -156,11 +156,23 @@ def measure_proj_cf(mf_state, qformer_state):
     print(f"  varying / constant              = {var_norm / (const_norm + 1e-12):.4f}")
     print(f"  mean ||h - mean(h)|| / ||h||    = "
           f"{(residual.norm(dim=-1).mean() / out.norm(dim=-1).mean()).item():.4f}")
-    print(f"  offdiag_cos(proj_cf out)  raw   = {_offdiag_cos(out):.4f}")
+    raw_cos = _offdiag_cos(out)
+    print(f"  offdiag_cos(proj_cf out)  raw   = {raw_cos:.4f}")
     print(f"                            centered = {_offdiag_cos(residual):.4f}")
-    print("  READ: varying/constant << 0.1 (or offdiag_cos raw > 0.99) means every")
-    print("        item enters cross-attention as nearly the same vector — the")
-    print("        collapse starts HERE, before any Q-Former layer.")
+
+    # Stage 1 reports the SAME statistic at the QUERY OUTPUT (offdiag_cos_raw,
+    # ~0.9998 on past runs). Comparing the two localises the collapse to one
+    # side of the Q-Former body, which decides which fix is even relevant.
+    if raw_cos > 0.99 or var_norm / (const_norm + 1e-12) < 0.1:
+        print("  READ: items enter cross-attention as nearly the SAME vector. The")
+        print("        collapse starts HERE, before any Q-Former layer — fix proj_cf")
+        print("        (bias scale / MF embedding scale), not the Q-Former.")
+    else:
+        print("  READ: proj_cf output still DISCRIMINATES items (raw cos well below")
+        print("        0.99). So if Stage 1 logs offdiag_cos_raw ~0.999 at the QUERY")
+        print("        output, the shared direction is ADDED INSIDE the Q-Former body")
+        print("        (learned queries + layer biases swamping the cross-attention")
+        print("        read). proj_cf is exonerated; the fix belongs downstream of it.")
 
 
 def _infonce_gain(
@@ -293,8 +305,10 @@ def main():
         measure_proj_cf(mf_state, _load_state(args.qformer_ckpt))
 
     if args.qformer_pkl:
-        with open(args.qformer_pkl, "rb") as handle:
-            blob = pickle.load(handle)
+        # torch.load, not pickle.load: build_qformer_dataset writes these with
+        # torch.save, so the stream carries persistent ids that bare pickle
+        # cannot resolve ("A load persistent id instruction was encountered").
+        blob = torch.load(args.qformer_pkl, map_location="cpu")
         samples = blob["samples"] if isinstance(blob, dict) else blob
 
         print("\n=== B) raw-MF InfoNCE (ceiling; compare to Stage-1 g_ii / g_ui)")
