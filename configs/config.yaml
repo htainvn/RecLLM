@@ -934,6 +934,31 @@ run:
     # toward zero.
     rec_weight_decay: 1e-4
 
+  sella_gated_step1:
+    # SeLLa's step 1 = TALLRec: a LoRA SFT with NO collaborative signal. The
+    # collaborative side enters for the first time in sella_gated_step3, with
+    # this LoRA loaded and FROZEN.
+    #
+    # This block exists separately from qformer_stage3_step1 for two reasons:
+    #   1. that script loads model.qformer_config.qformer_ckpt /
+    #      llm_proj_ckpt unconditionally, and those are qformer_stage2 outputs
+    #      which this branch never produces (FileNotFoundError at build time);
+    #   2. its prompt (no_hist_text) carries <UserProfile>/<TargetItemID>, so
+    #      with no stage-2 checkpoint LoRA would train against a Q-Former that
+    #      is random AND frozen.
+    # train_sella_gated_step1_lora.py sets both ckpts to "not_have" and hard-
+    # errors if the prompt is not text-only.
+    #
+    # Separate output_dir so nhánh A's step 1 (if it is also run) is untouched.
+    prompt_path: "/content/SigLLM/prompts/qformer_prompt_movie_text_only.txt"
+    output_dir: "/content/SigLLM/ckpt/sella_gated_step1_lora_qwen2/"
+    best_ckpt_name: "checkpoint_best.pth"
+    init_lr: 8e-5
+    # Must be below init_lr: the top-level min_lr (8e-5) EQUALS this init_lr,
+    # which flattens the cosine schedule into a constant.
+    min_lr: 8e-6
+    max_epoch: 5
+
   sella_gated_step3:
     # The ONLY training stage of the gated-Q-Former variant (arch:
     # sella_gated_rec_llm). Stage 1 (InfoNCE) and Stage 2 (generative) are NOT
@@ -948,9 +973,15 @@ run:
     output_dir: "/content/SigLLM/ckpt/sella_gated_step3_qwen2/"
     best_ckpt_name: "checkpoint_best.pth"
 
-    # Which LoRA to start from: step1 (SeLLa's arrangement) | step2 | self
-    # (resume this stage) | none (cold LoRA, an explicitly different experiment).
-    ckpt_from: step1
+    # Which LoRA to start from:
+    #   sella_step1  run.sella_gated_step1 — SeLLa's arrangement (text-only
+    #                TALLRec LoRA). THE DEFAULT.
+    #   step1|step2  nhánh A's qformer_stage3_step{1,2} checkpoints, for
+    #                comparing against a LoRA that was adapted with the
+    #                soft-token channel present.
+    #   self         resume this stage (also what eval-only runs want).
+    #   none         cold LoRA — an explicitly different experiment.
+    ckpt_from: sella_step1
 
     # MF joins the trainable set, as SeLLa does at its final step, in its own
     # optimizer param group. rec_lr_scale 3.33 * init_lr 3e-5 ~= 1e-4 for the

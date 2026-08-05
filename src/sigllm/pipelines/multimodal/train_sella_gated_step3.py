@@ -84,24 +84,34 @@ def setup_seeds(config):
 def resolve_warm_start(cfg, slug):
     """Path of the LoRA checkpoint this stage warm-starts from.
 
-    ``ckpt_from: step1`` (default) is SeLLa's arrangement: step 1 adapted the LLM
-    to the task, step 3 freezes it and trains the collaborative side. ``step2``
-    and ``none`` are the other two options; ``none`` means a cold LoRA.
+    ``sella_step1`` (default) is SeLLa's arrangement: a TALLRec text-only LoRA
+    SFT adapted the LLM to the task, and this stage freezes it and trains the
+    collaborative side. ``step1``/``step2`` point at nhánh A's checkpoints
+    instead (a LoRA that WAS adapted with the soft-token channel present), which
+    is a useful comparison but not SeLLa. ``self`` resumes this stage; ``none``
+    means a cold LoRA.
     """
     stage_cfg = cfg.run_cfg.sella_gated_step3
-    source = str(stage_cfg.get("ckpt_from", "step1")).lower()
+    source = str(stage_cfg.get("ckpt_from", "sella_step1")).lower()
     if source == "none":
         return None, source
-    if source == "step1":
-        stage = cfg.run_cfg.qformer_stage3_step1
-    elif source == "step2":
-        stage = cfg.run_cfg.qformer_stage3_step2
-    elif source == "self":
+    sources = {
+        "sella_step1": "sella_gated_step1",
+        "step1": "qformer_stage3_step1",
+        "step2": "qformer_stage3_step2",
+    }
+    if source == "self":
         stage = stage_cfg
+    elif source in sources:
+        stage = cfg.run_cfg.get(sources[source])
+        if stage is None:
+            raise ValueError(
+                f"ckpt_from={source!r} needs run.{sources[source]} in the config"
+            )
     else:
         raise ValueError(
-            "run.sella_gated_step3.ckpt_from must be 'step1', 'step2', 'self' or "
-            f"'none', got {source!r}"
+            "run.sella_gated_step3.ckpt_from must be one of 'sella_step1', "
+            f"'step1', 'step2', 'self', 'none' — got {source!r}"
         )
     best_name = stage.get("best_ckpt_name", "checkpoint_best.pth")
     return os.path.join(stage.output_dir, slug, best_name), source
@@ -198,7 +208,8 @@ def apply_overrides(cfg, slug):
             "Warm-start checkpoint (%s) not found at %s — LoRA will be COLD. With "
             "lora_trainable=false that means the LLM is the unadapted base model "
             "and the collaborative modules have to carry everything. Run "
-            "train_qformer_stage3_step1_lora first, or set "
+            "`python -m sigllm.pipelines.multimodal.train_sella_gated_step1_lora "
+            "--cfg-path <cfg>` first, or set "
             "run.sella_gated_step3.ckpt_from=none to make the cold start explicit.",
             source, ckpt_path,
         )
