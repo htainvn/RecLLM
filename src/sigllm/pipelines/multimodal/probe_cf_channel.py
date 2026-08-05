@@ -169,10 +169,6 @@ def encode_split(qformer, mf, sem_bank, loader, device):
         cond = target_cf if qformer.user_conditioned else None
         profile_q = qformer(
             hist_cf, instructions, user_cf=cond, source_mask=hist_mask, sem_vec=hist_sem,
-            # e_u, matching QRecLLM: the output residual's fallback readout must
-            # be cos(e_u, e_t), not cos(mask_mean(e_hist), e_t) — the latter is
-            # measured BELOW the MF dot product this probe compares against.
-            residual_vec=mf.user_encoder(uid),
         )
 
         # Mean over the Q queries — the same pooling Stage 1's L_ui scores and
@@ -291,14 +287,17 @@ def pooling_usage(qformer, mf, sem_bank, loader, device, max_batches=8):
         ins = [EVAL_INSTRUCTION] * b
         target_cf = mf.item_encoder(iid)
         cond = target_cf if qformer.user_conditioned else None
-        res_vec = mf.user_encoder(uid)
 
         def enc(h):
             return qformer(
                 mf.item_encoder(h), ins, user_cf=cond,
                 source_mask=h != mf.padding_index,
                 sem_vec=sem_bank[h] if sem_bank is not None else None,
-                residual_vec=res_vec,
+                # OFF: the residual is a bypass around the body, so leaving it on
+                # makes this measure the residual's invariance rather than the
+                # pooling. With residual_vec=e_u it was fully history-invariant and
+                # the diagnostic read as "attention collapsed" purely because of it.
+                apply_residual=False,
             ).float().mean(dim=1)
 
         full = enc(hist)

@@ -689,13 +689,12 @@ class QRecInstructAlignmentModel(nn.Module):
         item_cf = self.mf.item_encoder(item_ids)
         item_sem = self._sem_for(item_ids)
 
-        # residual_vec = e_u so the output residual's fallback is cos(e_u, e_t),
-        # matching what QRecLLM/the probe feed. Using the pooled history here
-        # instead would train the residual against a different (weaker) readout
-        # than the one served — measured 0.6411 vs MF_dot 0.6437.
+        # residual_vec left to _pool_source (the mask-pooled HISTORY), matching
+        # QRecLLM and the probe. Feeding e_u here — tried, reverted — duplicated
+        # <UserID> = id_proj(e_u) and made the profile output invariant to the
+        # history, which let this very loss be minimised WITHOUT pooling anything.
         user_q = self.qformer.encode_cf(
             user_src, source_mask=user_mask, sem_vec=user_sem,
-            residual_vec=self.mf.user_encoder(user_ids),
         )
         item_q = self.qformer.encode_cf(item_cf, sem_vec=item_sem)
 
@@ -853,7 +852,6 @@ class QRecInstructAlignmentModel(nn.Module):
             user_cf=item_cf if self.qformer.user_conditioned else None,
             source_mask=user_mask,
             sem_vec=user_sem,
-            residual_vec=self.mf.user_encoder(user_ids),
         )
         target_q = self.qformer.encode_cf(item_cf, sem_vec=self._sem_for(item_ids))
 
