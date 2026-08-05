@@ -64,6 +64,7 @@ class HFQFormerAdapter(nn.Module):
         candidate_fusion: bool = False,
         item_residual: bool = False,
         output_residual: bool = False,
+        memory_positional: int = 0,
     ):
         super().__init__()
 
@@ -228,6 +229,30 @@ class HFQFormerAdapter(nn.Module):
             # per-row relative norms survive (see _apply_output_residual). A
             # buffer, so it round-trips through state_dict and eval matches train.
             self.register_buffer("res_norm_ema", torch.zeros(1))
+
+        # POSITIONAL embedding on the cross-attention MEMORY.
+        #
+        # BLIP-2 / InstructBLIP add no positional signal to
+        # ``encoder_hidden_states`` — cross-attention over the memory is
+        # permutation-invariant. For image patches that is a deliberate choice; for
+        # a user's interaction HISTORY it removes the one axis on which a pooling
+        # function can beat MF's e_u. e_u is a free per-user parameter fit directly
+        # on the CTR objective over that user's whole training history, so a shared
+        # pooling function cannot out-represent it on seen users — EXCEPT by using
+        # something e_u does not have, and order/recency is exactly that.
+        # Without positions the Q-Former sees a bag of items and that avenue is
+        # structurally closed.
+        #
+        # Indexing is by absolute slot, which is correct here: MovieOODDataset
+        # LEFT-pads the history ([0]*pad + items), so the most recent item always
+        # sits at the last index and absolute position == recency rank counted from
+        # the end, consistently across rows.
+        #
+        # Zero-init, so a warm start is an exact no-op, and only applied when S > 1
+        # (a single-item encode has no order to speak of).
+        self.memory_positional = int(memory_positional)
+        if self.memory_positional > 0:
+            self.mem_pos = Parameter(torch.zeros(self.memory_positional, d_model))
 
         # Optional second cross-attention source: a frozen semantic (LLM-derived)
         # item embedding next to the CF vector. Attention weighs the two sources
@@ -431,6 +456,17 @@ class HFQFormerAdapter(nn.Module):
         else:
             raise ValueError(f"Expected cf_vec shape [B, d_cf] or [B, 1, d_cf], got {tuple(cf_vec.shape)}")
         encoder_hidden_states = self.proj_cf(cf_seq)
+        if self.memory_positional > 0 and cf_seq.size(1) > 1:
+            S = cf_seq.size(1)
+            if S <= self.memory_positional:
+                # Align to the END of the table so the most recent item always
+                # gets the same embedding regardless of how long the history is.
+                pos = self.mem_pos[self.memory_positional - S:]
+            else:
+                pos = self.mem_pos[-1:].expand(S, -1)
+            encoder_hidden_states = encoder_hidden_states + pos.unsqueeze(0).to(
+                encoder_hidden_states.dtype
+            )
         if self.candidate_fusion and fusion_target is not None:
             if fusion_target.dim() != 2 or fusion_target.size(0) != cf_seq.size(0):
                 raise ValueError(

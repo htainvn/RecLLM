@@ -179,6 +179,16 @@ model:
     # the SOURCE being read. Zero-init, so warm start is an exact no-op.
     item_residual: True
 
+    # Positional embedding on the cross-attention MEMORY (0 = off; set to the
+    # history cap). BLIP-2/InstructBLIP add none, so cross-attention over the
+    # history is permutation-invariant — the Q-Former sees a BAG of items. That
+    # closes the one axis on which a pooling function can beat e_u: order and
+    # recency, which a static per-user parameter does not have. Indexed by
+    # absolute slot, which is correct because MovieOODDataset LEFT-pads the
+    # history, so the most recent item is always last. Zero-init -> warm start
+    # is an exact no-op; only applied when S > 1.
+    memory_positional: ${datasets.movie_ood.max_history_length}
+
     # Q-Former internal dropout (hidden + attention). Was effectively 0.0 by
     # omission — no call site ever passed `dropout` to HFQFormerAdapter, so a
     # 3-layer transformer trained on ~17k user_item pairs ran with NO
@@ -684,6 +694,16 @@ run:
     rank_replay: 3
     probe_every_epochs: 1
     probe_split: valid_ood2.pkl
+    # COLD probe. The warm comparison is structurally rigged against the
+    # Q-Former: MF's e_u is a FREE PER-USER PARAMETER fit directly on the CTR
+    # objective over that user's entire training history, so on users seen in
+    # training a shared pooling FUNCTION cannot out-represent it — which is why
+    # every warm measurement showed combined_gain ~ 0 no matter the
+    # architecture. Cold users/items are where e_u / e_i were barely fit and a
+    # function that generalises should win. If the channel loses here too, it
+    # has no regime in which it helps.
+    probe_cold: True
+    probe_cold_split: test_ood2.pkl
     probe_batch_size: 64
     # Selection stays on val_gain_repr for now, deliberately: val_probe_gain is a
     # uAUC DELTA whose epoch-to-epoch noise has not been characterised yet, and
@@ -790,6 +810,7 @@ run:
     candidate_fusion: ${model.qformer_config.candidate_fusion}
     item_residual: ${model.qformer_config.item_residual}
     output_residual: ${model.qformer_config.output_residual}
+    memory_positional: ${model.qformer_config.memory_positional}
     qformer_dropout: ${model.qformer_config.qformer_dropout}
     # Semantic second cross-attention source (reuses item_llm_emb_path below).
     sem_source: ${model.qformer_config.sem_source}
@@ -908,6 +929,7 @@ run:
     candidate_fusion: ${model.qformer_config.candidate_fusion}
     item_residual: ${model.qformer_config.item_residual}
     output_residual: ${model.qformer_config.output_residual}
+    memory_positional: ${model.qformer_config.memory_positional}
     qformer_dropout: ${model.qformer_config.qformer_dropout}
     # Must match Stage 1 and Stage 3 — llm_proj is warm-started from Stage 1's
     # llm_align_proj here and exported to Stage 3 under a strict load.

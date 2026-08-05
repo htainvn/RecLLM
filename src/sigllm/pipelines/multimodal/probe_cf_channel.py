@@ -112,6 +112,7 @@ def build_qformer(cfg, device, d_sem):
         candidate_fusion=bool(qcfg.get("candidate_fusion", False)),
         item_residual=bool(qcfg.get("item_residual", False)),
         output_residual=bool(qcfg.get("output_residual", False)),
+        memory_positional=int(qcfg.get("memory_positional", 0)),
         d_user=int(cfg.model_cfg.rec_config.embedding_size),
         d_sem=d_sem,
     ).to(device)
@@ -242,14 +243,14 @@ def probe_split(split, enc):
     return results
 
 
-def build_probe_loader(dataset_cfg, filename, batch_size=64):
+def build_probe_loader(dataset_cfg, filename, batch_size=64, subset="all"):
     """Loader over a MovieOOD split, shaped for ``encode_split``.
 
     Exposed so Stage 1 can build this once at setup and probe DURING training
     instead of only after the fact.
     """
     return DataLoader(
-        MovieOODDataset(dataset_cfg, filename=filename),
+        MovieOODDataset(dataset_cfg, filename=filename, subset=subset),
         batch_size=batch_size,
         shuffle=False,
         num_workers=0,

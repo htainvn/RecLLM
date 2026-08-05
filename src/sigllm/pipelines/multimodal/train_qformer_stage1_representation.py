@@ -106,6 +106,7 @@ def _init_qformer(cfg, d_model, device, d_sem=None):
         candidate_fusion=bool(cfg.get("candidate_fusion", False)),
         item_residual=bool(cfg.get("item_residual", False)),
         output_residual=bool(cfg.get("output_residual", False)),
+        memory_positional=int(cfg.get("memory_positional", 0)),
         d_user=int(cfg.embedding_size),
         d_sem=d_sem,
     ).to(device)
@@ -919,6 +920,30 @@ def train_qformer_stage1_representation(cfg):
                 str(cfg.get("probe_split", "valid_ood2.pkl")),
                 batch_size=int(cfg.get("probe_batch_size", 64)),
             )
+            # COLD subset, measured separately. This is the setting where the
+            # Q-Former can actually win, and where every number so far was blind:
+            # MF's e_u is a FREE PER-USER PARAMETER fit directly on the CTR
+            # objective over that user's whole training history, so on users seen
+            # in training a shared pooling function cannot out-represent it — the
+            # warm comparison is rigged. For cold users/items e_u / e_i were barely
+            # trained, and a function that generalises should beat a parameter that
+            # was never fit. If the channel does not win HERE either, it has no
+            # setting in which it helps.
+            probe_cold_loader = None
+            if bool(cfg.get("probe_cold", True)):
+                try:
+                    probe_cold_loader = build_probe_loader(
+                        cfg.dataset_cfg,
+                        str(cfg.get("probe_cold_split", "test_ood2.pkl")),
+                        batch_size=int(cfg.get("probe_batch_size", 64)),
+                        subset="cold",
+                    )
+                    if len(probe_cold_loader.dataset) < 64:
+                        log_step("WARNING", f"cold probe split has only "
+                                 f"{len(probe_cold_loader.dataset)} rows; uAUC will be noisy")
+                except Exception as exc:
+                    log_step("WARNING", f"cold probe unavailable ({exc}); skipping")
+                    probe_cold_loader = None
             log_step(
                 "uAUC probe enabled",
                 f"split={cfg.get('probe_split', 'valid_ood2.pkl')}, "
@@ -977,6 +1002,24 @@ def train_qformer_stage1_representation(cfg):
         out = probe_metrics(
             model.qformer, model.mf, model.item_sem_emb, probe_uauc_loader, device
         )
+        if probe_cold_loader is not None:
+            cold = probe_metrics(
+                model.qformer, model.mf, model.item_sem_emb,
+                probe_cold_loader, device, prefix="cold_probe",
+            )
+            out.update(cold)
+            log_step(
+                f"[DIAG ep{epoch_index}] uAUC probe COLD (where the Q-Former can win)",
+                f"channel={cold['cold_probe_uauc']:.4f} dot={cold['cold_probe_uauc_dot']:.4f} | "
+                f"MF_dot={cold['cold_probe_mf_dot_uauc']:.4f} | "
+                f"GAIN={cold['cold_probe_gain']:+.4f} "
+                f"COMBINED_w={cold['cold_probe_combined_best_w']:g} "
+                f"combined_gain={cold['cold_probe_combined_gain']:+.4f} "
+                f"on {int(cold['cold_probe_rows'])} rows | MF's e_u is a free per-user "
+                f"parameter, so it cannot be out-represented on WARM users; cold is the "
+                f"setting where a pooling FUNCTION should win. combined_gain <= 0 here "
+                f"too means the channel has no regime in which it helps.",
+            )
         pool = pooling_usage(
             model.qformer, model.mf, model.item_sem_emb, probe_uauc_loader, device
         )

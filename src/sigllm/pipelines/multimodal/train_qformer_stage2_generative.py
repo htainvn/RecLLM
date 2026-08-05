@@ -147,6 +147,7 @@ def _init_qformer(cfg, device, d_sem=None):
         candidate_fusion=bool(cfg.get("candidate_fusion", False)),
         item_residual=bool(cfg.get("item_residual", False)),
         output_residual=bool(cfg.get("output_residual", False)),
+        memory_positional=int(cfg.get("memory_positional", 0)),
         d_user=int(cfg.embedding_size),
         d_sem=d_sem,
     ).to(device)

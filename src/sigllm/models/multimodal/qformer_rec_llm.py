@@ -124,6 +124,7 @@ class QRecLLM(Rec2Base):
         candidate_fusion=False,
         item_residual=False,
         output_residual=False,
+        memory_positional=0,
         qformer_dropout=0.0,
         center_soft_tokens=True,
         pretrained_item_llm_emb=None,
@@ -253,6 +254,7 @@ class QRecLLM(Rec2Base):
             candidate_fusion=self.candidate_fusion,
             item_residual=self.item_residual,
             output_residual=self.output_residual,
+            memory_positional=memory_positional,
             qformer_dropout=qformer_dropout,
         )
         self._init_projection(proj_token_num, freeze_proj, pretrained_llm_proj)
@@ -597,6 +599,7 @@ class QRecLLM(Rec2Base):
         candidate_fusion: bool = False,
         item_residual: bool = False,
         output_residual: bool = False,
+        memory_positional: int = 0,
         qformer_dropout: float = 0.0,
     ):
         log_step("Loading QFormer")
@@ -622,6 +625,7 @@ class QRecLLM(Rec2Base):
             candidate_fusion=candidate_fusion,
             item_residual=item_residual,
             output_residual=output_residual,
+            memory_positional=memory_positional,
         ).to(self.device)
 
         if pretrained_qformer and pretrained_qformer != "not_have":
@@ -1793,6 +1797,7 @@ class QRecLLM(Rec2Base):
         item_residual = bool(qformer_config.get("item_residual", False))
         qformer_dropout = float(qformer_config.get("qformer_dropout", 0.0))
         output_residual = bool(qformer_config.get("output_residual", False))
+        memory_positional = int(qformer_config.get("memory_positional", 0))
         center_soft_tokens = bool(qformer_config.get("center_soft_tokens", True))
         pretrained_item_llm_emb = qformer_config.get("item_llm_emb_path", None)
         sem_source = bool(qformer_config.get("sem_source", False))
@@ -1849,6 +1854,7 @@ class QRecLLM(Rec2Base):
             candidate_fusion=candidate_fusion,
             item_residual=item_residual,
             output_residual=output_residual,
+            memory_positional=memory_positional,
             qformer_dropout=qformer_dropout,
             center_soft_tokens=center_soft_tokens,
             pretrained_item_llm_emb=pretrained_item_llm_emb,
