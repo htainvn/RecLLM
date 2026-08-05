@@ -15,6 +15,10 @@ import os
 from sigllm.common.logging_utils import NotebookLogger
 from sigllm.common.registry import registry
 from sigllm.models.multimodal.base.rec_base_model import Rec2Base
+from sigllm.models.projection.soft_token_proj import (
+    build_soft_token_projection,
+    remap_legacy_proj_state,
+)
 from sigllm.models.q_former.hf_qformer_adapter import HFQFormerAdapter
 
 LOGGER = NotebookLogger.rich_logger("sigllm.rec_base_model")
@@ -118,6 +122,8 @@ class QRecLLM(Rec2Base):
         warm_token=False,
         direct_id_tokens=False,
         candidate_fusion=False,
+        item_residual=False,
+        center_soft_tokens=True,
         pretrained_item_llm_emb=None,
         ranking_loss_weight=0.0,
         ranking_loss_tau=1.0,
@@ -161,6 +167,8 @@ class QRecLLM(Rec2Base):
         self.warm_token = bool(warm_token)
         self.direct_id_tokens = bool(direct_id_tokens)
         self.candidate_fusion = bool(candidate_fusion)
+        self.item_residual = bool(item_residual)
+        self.center_soft_tokens = bool(center_soft_tokens)
         self.embed_placeholders = list(self.PLACEHOLDERS_FOR_EMBED)
         if self.warm_token and "<Warm_ID>" not in self.embed_placeholders:
             self.embed_placeholders = ["<UserProfile>", "<Warm_ID>", "<TargetItemID>"]
@@ -240,6 +248,7 @@ class QRecLLM(Rec2Base):
             d_user=rec_config.embedding_size,
             d_sem=self.item_sem_emb.size(-1) if self.item_sem_emb is not None else None,
             candidate_fusion=self.candidate_fusion,
+            item_residual=self.item_residual,
         )
         self._init_projection(proj_token_num, freeze_proj, pretrained_llm_proj)
         self._init_warm_token(pretrained_item_llm_emb)
@@ -581,6 +590,7 @@ class QRecLLM(Rec2Base):
         d_user: int = None,
         d_sem: int = None,
         candidate_fusion: bool = False,
+        item_residual: bool = False,
     ):
         log_step("Loading QFormer")
         log_step(
@@ -602,6 +612,7 @@ class QRecLLM(Rec2Base):
             d_user=d_user,
             d_sem=d_sem,
             candidate_fusion=candidate_fusion,
+            item_residual=item_residual,
         ).to(self.device)
 
         if pretrained_qformer and pretrained_qformer != "not_have":
@@ -669,18 +680,32 @@ class QRecLLM(Rec2Base):
                     f"proj_token_num({proj_token_num}) != qformer.num_queries({Q}). "
                     f"Using Q={Q} to keep injection consistent.")
 
-        self.llm_proj = nn.Sequential(
-            nn.Linear(d_q, H),
-            nn.LayerNorm(H),
+        self.llm_proj = build_soft_token_projection(
+            d_q, H, center=self.center_soft_tokens, num_positions=Q
         )
-        nn.init.normal_(self.llm_proj[0].weight, std=0.02)
-        nn.init.zeros_(self.llm_proj[0].bias)
-        nn.init.constant_(self.llm_proj[1].weight, H ** -0.5)
-        nn.init.zeros_(self.llm_proj[1].bias)
+        if self.center_soft_tokens:
+            log_step(
+                "Soft-token centering ACTIVE",
+                "llm_proj = Linear -> SharedDirectionCenter -> LayerNorm. Without it "
+                "the direction shared across items (offdiag_cos ~0.9998 at the query "
+                "output) survives into the LLM and every item injects a near-identical "
+                "vector — so a Stage-1 gain from pair_logit_center would not transfer.",
+            )
 
         if pretrained_llm_proj and pretrained_llm_proj != "not_have" and os.path.exists(pretrained_llm_proj):
             state_dict = torch.load(pretrained_llm_proj, map_location="cpu")
-            self.llm_proj.load_state_dict(state_dict, strict=True)
+            state_dict, _ = remap_legacy_proj_state(state_dict, self.llm_proj)
+            # strict=False only tolerates the centering BUFFERS being absent
+            # from a pre-centering checkpoint; the Linear/LayerNorm still have
+            # to match, and any other missing key is reported below.
+            msg = self.llm_proj.load_state_dict(state_dict, strict=False)
+            unexpected = [k for k in msg.unexpected_keys]
+            missing = [k for k in msg.missing_keys if "running_mean" not in k and "initialized" not in k]
+            if missing or unexpected:
+                log_step(
+                    "WARNING: Stage 2 projection loaded with mismatches",
+                    f"missing={missing}, unexpected={unexpected}",
+                )
             log_step("Loaded Stage 2 projection", pretrained_llm_proj)
 
         if freeze_proj:
@@ -911,22 +936,25 @@ class QRecLLM(Rec2Base):
         log_step("Trainable parameter counts", ", ".join(stats))
         self._has_logged_trainable_stats = True
 
-    def _log_information_flow(self, user_q, target_q, user_llm, target_llm, merged_flat):
+    def _log_information_flow(self, **tensors):
+        """Log per-channel stats for whatever channels this prompt built.
+
+        Takes kwargs rather than a fixed signature because the active channels
+        now depend on the prompt: dropping <TargetItemID> makes target_q /
+        target_llm None, and the load-bearing ones become profile_llm (the
+        Q-Former's one irreplaceable job, pooling variable-length history) plus
+        the single-token id_proj / warm_proj outputs. A channel whose std is ~0
+        is not carrying anything.
+        """
         if self._flow_log_steps >= self._max_flow_log_steps:
             return
 
-        log_step(
-            "Information flow",
-            " | ".join(
-                [
-                    tensor_stat_string("user_q", user_q),
-                    tensor_stat_string("target_q", target_q),
-                    tensor_stat_string("user_llm", user_llm),
-                    tensor_stat_string("target_llm", target_llm),
-                    tensor_stat_string("merged_embs", merged_flat),
-                ]
-            ),
-        )
+        parts = [
+            tensor_stat_string(name, value)
+            for name, value in tensors.items()
+            if value is not None
+        ]
+        log_step("Information flow", " | ".join(parts) if parts else "no channels built")
         self._flow_log_steps += 1
 
     def _init_prompts(self, prompt_path, prompt_template, max_txt_len, end_sym):
@@ -1019,15 +1047,20 @@ class QRecLLM(Rec2Base):
                 - 'UserID': (B,)
                 - 'TargetItemID': (B,)
                 - 'InteractedItemIDs_pad': (B, L)
-            feature_order (list): Order of features, e.g., ["<UserProfile>", "<TargetItemID>"]
-            
+            feature_order (list): placeholders present in the prompt, in textual
+                order (see get_placeholder_order). This DRIVES what gets built —
+                a placeholder absent from the prompt costs nothing, which is how
+                dropping <TargetItemID> removes the Q x target encode.
+
         Returns:
-            rec_embeds (dict):
-                - 'User_emb': None while TEMP_DISABLED_USER_CF is active
-                - 'TargetItem_emb': (B, Q, H) - Target item read out by Q queries
-                - 'UserProfile_emb': (B, Q, H) - History POOLED into Q queries
-                  (padding excluded via source_mask), or None
-                - 'merged_embs': (N, H) - Flattened & filtered valid tokens for LLM input
+            rec_embeds (dict), entries None when the prompt does not ask for them:
+                - 'TargetItem_emb'  : (B, Q, H) target item read out by Q queries
+                - 'UserProfile_emb' : (B, Q, H) history POOLED into Q queries
+                                      (padding excluded via source_mask)
+                - 'UserID_emb'      : (B, 1, H) id_proj(e_u)
+                - 'ItemID_emb'      : (B, 1, H) id_proj(e_i)
+                - 'Warm_emb'        : (B, 1, H) warm_proj(semantic item vector)
+                - 'merged_embs'     : (N, H) all slots flattened in feature_order
             rec_atts: None (Placeholder for future attention masks)
         """
         if self.rec_encoder is None:
@@ -1056,8 +1089,9 @@ class QRecLLM(Rec2Base):
         with self.maybe_autocast():
             # Stage-2 uses the in-tree rec encoder API: direct embedding lookup from ids.
             # TEMP_DISABLED_USER_CF: old path injected a user CF token into the LLM prompt.
-            user_q = None
-            user_llm = None
+            # TEMP_DISABLED_USER_CF: a Q-Former encode of e_u never fed the LLM.
+            # The user's CF vector now reaches it through <UserID> (id_proj,
+            # 1 token) instead, and the history through <UserProfile>.
             target_cf = self.rec_encoder.item_encoder(batch_data["TargetItemID"])  # [B,d_cf]
             target_sem = self._sem_for_items(batch_data["TargetItemID"])           # [B,d_sem] or None
 
@@ -1087,27 +1121,44 @@ class QRecLLM(Rec2Base):
             # candidates — it cancelled in uAUC and only added cross-user noise.
             target_cond = target_cf if self.user_conditioned else None
 
-            # 2) QFormer outputs (instruction-conditioned). The target encode is
-            # NOT conditioned on itself (no fusion_target -> no per-slot
-            # fuse_cf on its own slot), but it DOES get the user-target slot
-            # (slot_target): without it the target memory is a single item
-            # slot when sem_vec is None (cross-attention degenerates to a
-            # constant read) and the 8 <TargetItemID> tokens — nearly half the
-            # soft-token bandwidth — carry pure item identity with no idea who
-            # the user is. The slot's e_u*e_t block sums to the MF score.
-            # user_q = self.qformer(user_cf, ins_list)        # [B,Q,d_model]
-            target_q = self.qformer(
-                target_cf, ins_list, sem_vec=target_sem,
-                fusion_user=user_cf if self.candidate_fusion else None,
-                slot_target=target_cf if self.candidate_fusion else None,
-            )  # [B,Q,d_model]
-
-            # 3) Project to LLM hidden per token
-            # user_llm = self.llm_proj(user_q)               # [B,Q,H]
-            target_llm = self.llm_proj(target_q)           # [B,Q,H]
-
-            if self.ablate_soft_tokens:
-                target_llm = torch.zeros_like(target_llm)
+            # 2) QFormer target encode — ONLY when the prompt asks for it.
+            #
+            # DIVISION OF LABOUR. <TargetItemID> (Q tokens from the Q-Former)
+            # and <ItemID> (1 token from id_proj) are fed the SAME e_t, so the
+            # Q-Former path costs Q x more compute, passes through a LayerNorm,
+            # and by the data-processing inequality cannot carry more about e_t
+            # than the MLP does — it is a strictly weaker encoding of the same
+            # input. The Q-Former earns its keep on the one job an MLP cannot
+            # do: pooling a VARIABLE-LENGTH history into fixed slots
+            # (<UserProfile>). Identity and interaction go to the MLP.
+            #
+            # The routing argument for keeping a per-item CF slot in cross-
+            # attention (so attention can weigh CF against the semantic source
+            # per item, trusting CF for warm items and text for cold ones)
+            # presupposes that the CF slot actually VARIES per item. At the
+            # measured q_pair_cos = 1.000 it does not — every item enters
+            # identically, so there is nothing to route on. That niche only
+            # opens up once the collapse is removed.
+            #
+            # Driven by the PROMPT, not a flag: drop <TargetItemID> from the
+            # prompt and this whole branch (and its Q x cost) disappears.
+            want_target = feature_order is None or "<TargetItemID>" in feature_order
+            target_q = None
+            target_llm = None
+            if want_target:
+                # The target encode is NOT conditioned on itself (no
+                # fusion_target -> no per-slot fuse_cf on its own slot), but it
+                # DOES get the user-target slot (slot_target): without it the
+                # target memory is a single item slot when sem_vec is None and
+                # cross-attention degenerates to a constant read.
+                target_q = self.qformer(
+                    target_cf, ins_list, sem_vec=target_sem,
+                    fusion_user=user_cf if self.candidate_fusion else None,
+                    slot_target=target_cf if self.candidate_fusion else None,
+                )  # [B,Q,d_model]
+                target_llm = self.llm_proj(target_q)           # [B,Q,H]
+                if self.ablate_soft_tokens:
+                    target_llm = torch.zeros_like(target_llm)
 
             warm_llm = None
             if self.warm_token and self.warm_proj is not None:
@@ -1120,14 +1171,21 @@ class QRecLLM(Rec2Base):
             merged_flat = None
 
             has_interacted = "InteractedItemIDs_pad" in batch_data
-            need_merge = (
+            want_profile = (
                 has_interacted
                 and feature_order is not None
                 and "<UserProfile>" in feature_order
-                and "<TargetItemID>" in feature_order
             )
+            # Merge whenever the prompt asks for ANY soft slot. The old gate
+            # required BOTH <UserProfile> AND <TargetItemID>, so removing
+            # <TargetItemID> silently disabled soft-token injection entirely
+            # (the prompt files still carry warnings about that trap). Every
+            # placeholder in play has a FIXED slot count, so all rows get the
+            # same number of unk slots and the row-major flatten below stays
+            # aligned with the row-major scan in wrap_prompt_with_soft_tokens_v2.
+            need_merge = feature_order is not None and len(feature_order) > 0
 
-            if need_merge:
+            if want_profile:
                 # The whole history is POOLED into Q soft tokens, not L*Q: the
                 # L item vectors are the cross-attention source sequence, and
                 # the Q learned queries read them out. hist_mask keeps padded
@@ -1152,35 +1210,45 @@ class QRecLLM(Rec2Base):
                 )
 
                 profile_llm = self.llm_proj(profile_q)                          # [B,Q,H]
-                
+
                 if self.ablate_soft_tokens:
                     profile_llm = torch.zeros_like(profile_llm)
 
-                # mask expand theo Q
+            if need_merge:
                 ones_q = torch.ones((B, Q), device=device, dtype=torch.long)
+                ones_1 = torch.ones((B, 1), device=device, dtype=torch.long)
 
-                ph2emb = {
-                    # TEMP_DISABLED_USER_CF: old merge map included "<UserID>": user_llm.
-                    # "<UserID>": user_llm,                 # [B,Q,H]
-                    "<UserProfile>": profile_llm,  # [B,Q,H] — history pooled into Q tokens
-                    "<TargetItemID>": target_llm          # [B,Q,H]
-                }
-                ph2mask = {
-                    # "<UserID>": ones_q,
-                    "<UserProfile>": ones_q,
-                    "<TargetItemID>": ones_q
-                }
+                # Only slots that were actually BUILT are registered. A prompt
+                # naming a placeholder whose tensor is None (e.g. <UserProfile>
+                # with no history in the batch, or <ItemID> with
+                # direct_id_tokens off) is a configuration error, and the
+                # KeyError below is the intended loud failure — silently
+                # injecting the wrong count would corrupt every slot after it.
+                ph2emb, ph2mask = {}, {}
+                if profile_llm is not None:
+                    ph2emb["<UserProfile>"] = profile_llm   # [B,Q,H] history pooled
+                    ph2mask["<UserProfile>"] = ones_q
+                if target_llm is not None:
+                    ph2emb["<TargetItemID>"] = target_llm   # [B,Q,H]
+                    ph2mask["<TargetItemID>"] = ones_q
                 if self.warm_token and warm_llm is not None:
                     ph2emb["<Warm_ID>"] = warm_llm          # [B,1,H]
-                    ph2mask["<Warm_ID>"] = torch.ones((B, 1), device=device, dtype=torch.long)
-                if self.direct_id_tokens:
-                    ones_1 = torch.ones((B, 1), device=device, dtype=torch.long)
-                    if user_id_llm is not None:
-                        ph2emb["<UserID>"] = user_id_llm    # [B,1,H]
-                        ph2mask["<UserID>"] = ones_1
-                    if item_id_llm is not None:
-                        ph2emb["<ItemID>"] = item_id_llm    # [B,1,H]
-                        ph2mask["<ItemID>"] = ones_1
+                    ph2mask["<Warm_ID>"] = ones_1
+                if user_id_llm is not None:
+                    ph2emb["<UserID>"] = user_id_llm        # [B,1,H]
+                    ph2mask["<UserID>"] = ones_1
+                if item_id_llm is not None:
+                    ph2emb["<ItemID>"] = item_id_llm        # [B,1,H]
+                    ph2mask["<ItemID>"] = ones_1
+
+                missing = [ph for ph in feature_order if ph not in ph2emb]
+                if missing:
+                    raise KeyError(
+                        f"prompt requests soft-token placeholders {missing} but no "
+                        f"embedding was built for them. Available: {sorted(ph2emb)}. "
+                        f"Check warm_token / direct_id_tokens and that the batch "
+                        f"carries InteractedItemIDs_pad for <UserProfile>."
+                    )
 
                 merged_embeds = torch.cat([ph2emb[ph] for ph in feature_order], dim=1)    # [B, sum_slots, H]
                 full_mask = torch.cat([ph2mask[ph] for ph in feature_order], dim=1)       # [B, sum_slots]
@@ -1189,15 +1257,22 @@ class QRecLLM(Rec2Base):
                 merged_flat = merged_embeds[idx[:, 0], idx[:, 1]]                         # [N,H]
 
             rec_embeds = {
-                "User_emb": user_llm,                 # None while TEMP_DISABLED_USER_CF is active
-                "TargetItem_emb": target_llm,         # [B,Q,H]
+                "TargetItem_emb": target_llm,         # [B,Q,H] or None (prompt-driven)
                 "UserProfile_emb": profile_llm,  # [B,Q,H] or None
                 "Warm_emb": warm_llm,                  # [B,1,H] or None
                 "UserID_emb": user_id_llm,             # [B,1,H] or None (direct path)
                 "ItemID_emb": item_id_llm,             # [B,1,H] or None (direct path)
                 "merged_embs": merged_flat,             # [N,H] or None
             }
-            self._log_information_flow(user_q, target_q, user_llm, target_llm, merged_flat)
+            self._log_information_flow(
+                target_q=target_q,
+                target_llm=target_llm,
+                profile_llm=profile_llm,
+                user_id_llm=user_id_llm,
+                item_id_llm=item_id_llm,
+                warm_llm=warm_llm,
+                merged_embs=merged_flat,
+            )
 
         return rec_embeds, None
 
@@ -1262,6 +1337,12 @@ class QRecLLM(Rec2Base):
                 preview_parts.append(
                     f"[TargetItemID id={target_id} soft_tokens={self.proj_token_num}]",
                 )
+            if self.direct_id_tokens:
+                for ph in ("<UserID>", "<ItemID>"):
+                    if ph in prompt_ori:
+                        preview_parts.append(f"[{ph.strip('<>')} id_proj soft_tokens=1]")
+            if self.warm_token and "<Warm_ID>" in prompt_ori:
+                preview_parts.append("[Warm_ID warm_proj soft_tokens=1]")
             log_step("prompt injection preview:", " | ".join(preview_parts))
             self.has_print_prompt = True
 
@@ -1282,32 +1363,29 @@ class QRecLLM(Rec2Base):
 
         replaced_idx = torch.nonzero(prompts_tokens.input_ids == unk_token_id)
 
-        has_history_placeholder = "<UserProfile>" in prompt_ori
-        has_target_placeholder = "<TargetItemID>" in prompt_ori
-
-        if has_history_placeholder and has_target_placeholder and rec_embeds.get('merged_embs') is not None:
-            inputs_embeds[replaced_idx[:, 0], replaced_idx[:, 1]] = rec_embeds['merged_embs'].to(inputs_embeds)
-
-        elif has_target_placeholder:
-            # TEMP_DISABLED_USER_CF: old target-only branch concatenated user and target tokens.
-            # emb_to_inject = torch.cat([rec_embeds['User_emb'], rec_embeds['TargetItem_emb']], dim=1)
-            emb_to_inject = rec_embeds['TargetItem_emb']
-            emb_to_inject = emb_to_inject.reshape(-1, emb_to_inject.shape[-1])
-
-            # The prompt can contain both history and target placeholder tokens.
-            # Inject the target embeddings only into the final Q soft-token slots
-            # for each sample, which correspond to the target placeholder.
-            target_count = self.proj_token_num
-            for b in range(batch_size):
-                sample_positions = torch.nonzero(prompts_tokens.input_ids[b] == unk_token_id, as_tuple=False).squeeze(-1)
-                if sample_positions.numel() < target_count:
-                    continue
-                start = sample_positions.numel() - target_count
-                target_positions = sample_positions[start:]
-                if target_positions.numel() == 0:
-                    continue
-                src = emb_to_inject[b * target_count:(b + 1) * target_count].to(inputs_embeds.dtype)
-                inputs_embeds[b, target_positions] = src
+        # ONE injection path for every placeholder combination. merged_embs is
+        # built in feature_order, which get_placeholder_order sorts by position
+        # in the prompt, so its row-major flatten lines up slot-for-slot with
+        # this row-major scan for the unk ids. The previous code special-cased
+        # "<UserProfile> AND <TargetItemID>" here and fell back to a
+        # target-only loop otherwise — which meant a prompt without
+        # <TargetItemID> hit neither branch and silently injected NOTHING while
+        # still reserving the slots.
+        merged = rec_embeds.get('merged_embs') if rec_embeds else None
+        if merged is not None:
+            expected = replaced_idx.shape[0]
+            if merged.shape[0] != expected:
+                # A mismatch means the reserved slots and the built embeddings
+                # disagree — every slot after the first divergence would get the
+                # wrong vector, which is invisible in the loss but corrupts the
+                # channel. Truncation of a long prompt is the usual cause.
+                raise ValueError(
+                    f"soft-token slot mismatch: prompt reserved {expected} unk slots but "
+                    f"{merged.shape[0]} embeddings were built. Placeholders="
+                    f"{self.get_placeholder_order(prompt_ori)}. A truncated prompt "
+                    f"(max_txt_len={self.max_txt_len}) drops slots from the RIGHT."
+                )
+            inputs_embeds[replaced_idx[:, 0], replaced_idx[:, 1]] = merged.to(inputs_embeds)
 
         elif "<DCNFeature>" in prompt_ori:
             raise NotImplementedError("<DCNFeature> is not implemented in this version")
@@ -1549,9 +1627,9 @@ class QRecLLM(Rec2Base):
         if not feature_order:
             self._log_trainable_module_stats()
             rec_embeds = {
-                "User_emb": None,
                 "TargetItem_emb": None,
-                "InteractedItems_embs": None,
+                "UserProfile_emb": None,
+                "ItemID_emb": None,
                 "merged_embs": None,
             }
             rec_atts = None
@@ -1566,7 +1644,20 @@ class QRecLLM(Rec2Base):
         llm_embeds, llm_atts = self.wrap_prompt_with_soft_tokens_v2(rec_embeds, rec_atts, batch_data, prompt_template)
         # Expose the aligned target-item CF soft tokens ([B, Q, H] or None) so the
         # rank-preserving alignment loss can read a per-user score off them.
-        cf_emb = rec_embeds.get("TargetItem_emb")
+        # Whichever aligned CF tensor this prompt actually produces. Hard-wiring
+        # TargetItem_emb meant a prompt without <TargetItemID> silently switched
+        # align_rank_loss OFF (cf_emb=None is one of its gate conditions), so the
+        # loss would report as configured while contributing nothing. Order of
+        # preference: the target's Q-Former tokens, else the direct <ItemID>
+        # token (also per-candidate, so a per-user BPR still has signal), else
+        # the pooled profile.
+        cf_emb = (
+            rec_embeds.get("TargetItem_emb")
+            if rec_embeds.get("TargetItem_emb") is not None
+            else rec_embeds.get("ItemID_emb")
+            if rec_embeds.get("ItemID_emb") is not None
+            else rec_embeds.get("UserProfile_emb")
+        )
         return llm_embeds, llm_atts, cf_emb
 
     def generate_for_samples(self, samples, return_all=False):
@@ -1680,6 +1771,8 @@ class QRecLLM(Rec2Base):
         warm_token = bool(qformer_config.get("warm_token", False))
         direct_id_tokens = bool(cfg.get("direct_id_tokens", False))
         candidate_fusion = bool(qformer_config.get("candidate_fusion", False))
+        item_residual = bool(qformer_config.get("item_residual", False))
+        center_soft_tokens = bool(qformer_config.get("center_soft_tokens", True))
         pretrained_item_llm_emb = qformer_config.get("item_llm_emb_path", None)
         sem_source = bool(qformer_config.get("sem_source", False))
         item_sem_emb_path = qformer_config.get("item_sem_emb_path", None)
@@ -1733,6 +1826,8 @@ class QRecLLM(Rec2Base):
             warm_token=warm_token,
             direct_id_tokens=direct_id_tokens,
             candidate_fusion=candidate_fusion,
+            item_residual=item_residual,
+            center_soft_tokens=center_soft_tokens,
             pretrained_item_llm_emb=pretrained_item_llm_emb,
             ranking_loss_weight=ranking_loss_weight,
             ranking_loss_tau=ranking_loss_tau,

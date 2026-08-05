@@ -1,0 +1,41 @@
+A user <UserID> has a collaborative taste profile of: <UserProfile>. They have highly rated these movies: <ItemTitleList>. Leverage the information above to predict whether the user would enjoy the movie titled <TargetItemTitle>, whose collaborative signature is <ItemID> and whose semantic profile is <Warm_ID> Answer with "Yes" or "No".
+A user <UserID> has a collaborative taste profile of: <UserProfile>. They previously gave strong ratings to: <ItemTitleList>. Based on this preference history, predict whether the user would like the movie <TargetItemTitle>, whose collaborative signature is <ItemID> and whose semantic profile is <Warm_ID> Answer with "Yes" or "No".
+Given a user <UserID> with collaborative taste profile <UserProfile> and highly rated movies <ItemTitleList>, decide whether the user would enjoy <TargetItemTitle>, whose collaborative signature is <ItemID> and whose semantic profile is <Warm_ID> Answer with "Yes" or "No".
+# DIVISION OF LABOUR between the Q-Former and the MLP. <TargetItemID> is GONE.
+#
+# Slot budget: 8 (<UserProfile>) + 1 (<UserID>) + 1 (<ItemID>) + 1 (<Warm_ID>)
+# = 11 soft tokens, down from 19 in qformer_prompt_movie_direct_id.txt.
+#
+# Why <TargetItemID> was dropped. It fed the Q-Former the SAME e_t that
+# <ItemID> feeds id_proj, so the two carried one input twice — except the
+# Q-Former version cost 8x the compute, passed through an extra LayerNorm, and
+# by the data-processing inequality could not carry MORE about e_t than the
+# 1-token MLP does. It was a strictly weaker encoding of the same vector.
+#
+# What each component is now for:
+#   <UserProfile>  Q-Former, 8 tokens. Pools a VARIABLE-LENGTH history into
+#                  fixed slots via cross-attention with a padding mask — the one
+#                  job an MLP structurally cannot do. This is what the Q-Former
+#                  is kept for.
+#   <UserID>       id_proj(e_u), 1 token. Raw user identity.
+#   <ItemID>       id_proj(e_i), 1 token. Raw item identity + the CF channel for
+#                  the candidate. With <UserID> present the LLM sees both
+#                  vectors unreduced and can in principle reconstruct the MF
+#                  dot product e_u . e_i, so this path lower-bounds the model at
+#                  the MF baseline.
+#   <Warm_ID>      warm_proj(semantic item vector), 1 token. The semantic half,
+#                  which matters most for cold items where CF is weak. Requires
+#                  model.qformer_config.warm_token: True — RECOMMENDED with this
+#                  prompt, since dropping <TargetItemID> also removed the
+#                  Q-Former's semantic cross-attention read for the target.
+#
+# A counter-argument for keeping a per-item CF slot in cross-attention is
+# ROUTING: attention could weigh CF against the semantic source per item,
+# trusting CF for warm items and text for cold ones. That argument requires the
+# CF slot to actually VARY per item, and at the measured q_pair_cos = 1.000 it
+# does not — every item enters identically, so there is nothing to route on.
+# Revisit only after the collapse is gone.
+#
+# Requires: model.direct_id_tokens: True (else <UserID>/<ItemID> are stripped
+# and the collaborative channel disappears entirely) and
+# model.qformer_config.warm_token: True (else <Warm_ID> is stripped).

@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sigllm.models.projection.soft_token_proj import build_soft_token_projection
+
 
 LLM_EMB_NORMALIZERS = ("none", "center", "whiten")
 
@@ -100,16 +102,20 @@ class QRecInstructAlignmentModel(nn.Module):
         itc_logit_center=True,
         bpr_logit_center=True,
         sem_for_text_losses=False,
+        center_soft_tokens=True,
     ) -> None:
         super().__init__()
         self.mf = mf
         self.qformer = qformer
         # Batch-center the pooled vectors of the collaborative InfoNCE terms
-        # (L_ii / L_ui) before the cosine. Default OFF: measured on ml-1m it
-        # pushed L_ii to 24.4 against a ln(n) of 6.4 (the centered residual is
-        # near low-rank, cosines go bipolar, and 1/tau amplifies that inside
-        # logsumexp). Turning it off recovered g_ii from -18.0 to -4.0 in one
-        # epoch. See _pooled_pair_logits.
+        # (L_ii / L_ui) before the cosine. The old default was OFF on evidence
+        # collected at tau=0.07 (L_ii 24.4 against ln(n) 6.4), but that
+        # comparison was confounded: measured on the raw-MF ceiling, RAW at
+        # tau=0.07 is ALSO worse than chance (gain -1.05), so tau was the
+        # problem, not centering. At tau=0.2 centering is 2.7x better on gain
+        # and 2.5x on top1 for the history-pooled user side. Now defaults ON in
+        # config, together with tau_ui=0.2 / tau_ii=0.5 — the three must move
+        # together. See _pooled_pair_logits and diagnose_collab_collapse.py.
         self.pair_logit_center = bool(pair_logit_center)
         self.itc_logit_center = bool(itc_logit_center)
         # Centering for the candidate-conditioned BPR, which fails the OPPOSITE
@@ -171,14 +177,14 @@ class QRecInstructAlignmentModel(nn.Module):
             # warm-starts ``llm_proj`` from it — the alignment must live in the
             # projection the frozen LLM actually reads, not a throwaway head.
             d_q = qformer.output_dim
-            self.llm_align_proj = nn.Sequential(
-                nn.Linear(d_q, d_llm),
-                nn.LayerNorm(d_llm),
+            # Shared factory: Stage 2 warm-starts llm_proj from this state dict
+            # under a strict load, so the layout (including the centering module)
+            # has to be identical on both sides.
+            self.llm_align_proj = build_soft_token_projection(
+                d_q, d_llm,
+                center=bool(center_soft_tokens),
+                num_positions=int(qformer.num_queries),
             )
-            nn.init.normal_(self.llm_align_proj[0].weight, std=0.02)
-            nn.init.zeros_(self.llm_align_proj[0].bias)
-            nn.init.constant_(self.llm_align_proj[1].weight, d_llm ** -0.5)
-            nn.init.zeros_(self.llm_align_proj[1].bias)
         else:
             self.item_llm_emb = None
             self.llm_align_proj = None

@@ -47,6 +47,10 @@ from sigllm.models.projection.qformer_alignment_model import (
     QRecInstructAlignmentModel,
     normalize_item_llm_emb,
 )
+from sigllm.models.projection.soft_token_proj import (
+    build_soft_token_projection,
+    remap_legacy_proj_state,
+)
 from sigllm.models.q_former.hf_qformer_adapter import HFQFormerAdapter
 from sigllm.models.rec.matrix_factorization import MatrixFactorization
 
@@ -132,6 +136,10 @@ def _init_qformer(cfg, device, d_sem=None):
         # conditioning path is unused here (no user_cf is passed), but the
         # weights must ride through to Stage 3 intact.
         user_conditioned=bool(cfg.get("user_conditioned", False)),
+        # Must mirror model.qformer_config.* — these change the adapter SHAPE,
+        # and the checkpoint flows stage1 -> stage2 -> stage3 under a strict load.
+        candidate_fusion=bool(cfg.get("candidate_fusion", False)),
+        item_residual=bool(cfg.get("item_residual", False)),
         d_user=int(cfg.embedding_size),
         d_sem=d_sem,
     ).to(device)
@@ -172,29 +180,39 @@ def _init_llm(model_path, device):
     return tokenizer, llm
 
 
-def _build_projection(d_q: int, hidden_size: int, device, ckpt_path: Optional[str] = None) -> nn.Module:
-    """Linear + LayerNorm projection.
+def _build_projection(
+    d_q: int,
+    hidden_size: int,
+    device,
+    ckpt_path: Optional[str] = None,
+    center: bool = True,
+    num_positions: Optional[int] = None,
+) -> nn.Module:
+    """Linear -> [SharedDirectionCenter] -> LayerNorm.
 
-    LayerNorm.weight is initialised at ``1/sqrt(hidden_size)`` so the output
-    has ``mean_l2 ~ 1`` from step 0, matching Vicuna's native input
-    embedding scale. Default LayerNorm init (weight=1) gives mean_l2 ~
-    sqrt(H) ~ 64, which drowns the text portion of the prompt under the
-    frozen attention.
+    Built by the shared factory so Stage 1 / 2 / 3 cannot drift apart — the
+    weights flow between them under a strict load. See
+    ``sigllm.models.projection.soft_token_proj`` for why the centering sits
+    between the Linear and the LayerNorm and why it tracks a running (not batch)
+    mean.
 
-    ``ckpt_path`` warm-starts from Stage 1's ``llm_align_proj`` (same
-    Sequential layout), carrying the SeLLa alignment into the injection path.
+    ``ckpt_path`` warm-starts from Stage 1's ``llm_align_proj`` (same layout),
+    carrying the SeLLa alignment into the injection path.
     """
-    proj = nn.Sequential(
-        nn.Linear(d_q, hidden_size),
-        nn.LayerNorm(hidden_size),
+    proj = build_soft_token_projection(
+        d_q, hidden_size, center=center, num_positions=num_positions
     ).to(device).float()
-    nn.init.normal_(proj[0].weight, std=0.02)
-    nn.init.zeros_(proj[0].bias)
-    nn.init.constant_(proj[1].weight, hidden_size ** -0.5)
-    nn.init.zeros_(proj[1].bias)
 
     if ckpt_path and os.path.exists(ckpt_path):
-        proj.load_state_dict(torch.load(ckpt_path, map_location="cpu"), strict=True)
+        state_dict = torch.load(ckpt_path, map_location="cpu")
+        state_dict, _ = remap_legacy_proj_state(state_dict, proj)
+        msg = proj.load_state_dict(state_dict, strict=False)
+        stale = [
+            k for k in list(msg.missing_keys) + list(msg.unexpected_keys)
+            if "running_mean" not in k and "initialized" not in k
+        ]
+        if stale:
+            log_step("WARNING", f"proj_ckpt_in layout mismatch on keys: {stale}")
         log_step("Warm-started llm_proj from Stage 1 aligned projection", ckpt_path)
     elif ckpt_path:
         log_step("WARNING", f"proj_ckpt_in not found at {ckpt_path}; using fresh projection init")
@@ -643,7 +661,10 @@ def train_qformer_stage2_generative(cfg):
     d_q = qformer.output_dim
     hidden_size = llm.config.hidden_size
     llm_proj = _build_projection(
-        d_q, hidden_size, device, ckpt_path=cfg.get("proj_ckpt_in")
+        d_q, hidden_size, device,
+        ckpt_path=cfg.get("proj_ckpt_in"),
+        center=bool(cfg.get("center_soft_tokens", True)),
+        num_positions=int(qformer.num_queries),
     ).train()
 
     w_llm = float(cfg.get("w_llm", 0.0))

@@ -88,6 +88,10 @@ def _init_qformer(cfg, d_model, device, d_sem=None):
         # Build (and pretrain) the conditioning path here so user_proj does not
         # sit at its zero init through all of Stage 1 and reach Stage 3 blind.
         user_conditioned=bool(cfg.get("user_conditioned", False)),
+        # Must mirror model.qformer_config.* — these change the adapter SHAPE,
+        # and the checkpoint flows stage1 -> stage2 -> stage3 under a strict load.
+        candidate_fusion=bool(cfg.get("candidate_fusion", False)),
+        item_residual=bool(cfg.get("item_residual", False)),
         d_user=int(cfg.embedding_size),
         d_sem=d_sem,
     ).to(device)
@@ -764,6 +768,10 @@ def train_qformer_stage1_representation(cfg):
         itc_logit_center=bool(cfg.get("itc_logit_center", True)),
         bpr_logit_center=bool(cfg.get("bpr_logit_center", True)),
         sem_for_text_losses=bool(cfg.get("sem_for_text_losses", False)),
+        # Must match model.qformer_config.center_soft_tokens: Stage 2
+        # warm-starts llm_proj from this llm_align_proj under a strict load, so
+        # a mismatch here silently changes the layout the export has to fit.
+        center_soft_tokens=bool(cfg.get("center_soft_tokens", True)),
     ).to(device)
 
     # DIN-style pretraining of the candidate-conditioning path: only possible

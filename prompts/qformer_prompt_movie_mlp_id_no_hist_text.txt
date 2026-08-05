@@ -1,0 +1,25 @@
+A user <UserID> has a collaborative taste profile of: <UserProfile>. Leverage this profile to predict whether the user would enjoy the movie titled <TargetItemTitle>, whose collaborative signature is <ItemID> and whose semantic profile is <Warm_ID> Answer with "Yes" or "No".
+A user <UserID> has a collaborative taste profile of: <UserProfile>. Based on this profile, predict whether the user would like the movie <TargetItemTitle>, whose collaborative signature is <ItemID> and whose semantic profile is <Warm_ID> Answer with "Yes" or "No".
+Given a user <UserID> with collaborative taste profile <UserProfile>, decide whether the user would enjoy <TargetItemTitle>, whose collaborative signature is <ItemID> and whose semantic profile is <Warm_ID> Answer with "Yes" or "No".
+# STEP 1 companion to qformer_prompt_movie_mlp_id.txt: identical soft-token
+# layout, with <ItemTitleList> REMOVED.
+#
+# Slot layout is EXACTLY the one Step 2 uses — 8 (<UserProfile>) + 1 (<UserID>)
+# + 1 (<ItemID>) + 1 (<Warm_ID>) = 11 tokens, no <TargetItemID>. That identity
+# is the point of this file. Step 1 teaches LoRA to READ the soft-token channel;
+# if Step 1 trained against a 19-token layout with an 8-token <TargetItemID> and
+# Step 2 then switched to a 1-token <ItemID>, LoRA would have learned to read a
+# channel that no longer exists — the same train/serve skew that made the
+# earlier Step-2 uAUC flat (see the prompt_path history in
+# run.qformer_stage3_step1).
+#
+# <ItemTitleList> is dropped for the reason the previous no_hist_text variant
+# documented: the full prompt carries the user's history TWICE, as pooled soft
+# tokens and as plain text titles, and the text path is the one Qwen2 already
+# understands from pretraining — so LoRA has no reason to learn the soft tokens.
+# Removing the text makes <UserProfile> the ONLY route by which history reaches
+# the LLM. <TargetItemTitle> is deliberately KEPT so only the history channel
+# differs from Step 2.
+#
+# Requires model.direct_id_tokens: True and
+# model.qformer_config.warm_token: True, same as the Step-2 prompt.

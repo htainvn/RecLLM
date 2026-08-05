@@ -62,6 +62,7 @@ class HFQFormerAdapter(nn.Module):
         d_user: Optional[int] = None,
         d_sem: Optional[int] = None,
         candidate_fusion: bool = False,
+        item_residual: bool = False,
     ):
         super().__init__()
 
@@ -156,6 +157,33 @@ class HFQFormerAdapter(nn.Module):
             self.fuse_user = nn.Linear(3 * d_cf, d_model, bias=False)
             nn.init.zeros_(self.fuse_user.weight)
 
+        # Residual injection of the CF input straight into the query tokens,
+        # bypassing cross-attention. Diagnosed need: proj_cf's output still
+        # discriminates items (offdiag_cos 0.70, item-varying/constant 0.66) but
+        # the query OUTPUT sits at offdiag_cos ~0.9998 — the body attenuates the
+        # item-specific component ~45x relative to the shared one (learned
+        # queries + layer biases dominating the residual stream, and with
+        # cross_attention_frequency=2 only some layers re-read the memory at
+        # all). Adding proj of the (mask-pooled) CF input to the queries gives
+        # that signal a short path in.
+        #
+        # Complementary to user_proj, not a duplicate: user_proj shifts the
+        # queries by the CANDIDATE (target_cf, passed in as user_cf), while this
+        # injects the SOURCE the queries are about to read (the item itself, or
+        # the pooled history). Different inputs, both per-query.
+        #
+        # Zero-init, like user_proj / proj_sem / fuse_cf. Unlike those, the
+        # gradient reaching it is now meaningful: the collaborative losses were
+        # blind to this signal while the pair logits were uncentered at tau=0.07
+        # (measured worse-than-chance on clean embeddings), so a zero-init path
+        # had nothing to grow from. With pair_logit_center + the retuned taus it
+        # does. If the collapse survives anyway, the init scale is the knob.
+        self.item_residual = bool(item_residual)
+        if self.item_residual:
+            self.item_res_proj = nn.Linear(d_cf, num_queries * d_model)
+            nn.init.zeros_(self.item_res_proj.weight)
+            nn.init.zeros_(self.item_res_proj.bias)
+
         # Optional second cross-attention source: a frozen semantic (LLM-derived)
         # item embedding next to the CF vector. Attention weighs the two sources
         # per item, so cold items (weak CF, rich text) can lean on semantics and
@@ -187,6 +215,31 @@ class HFQFormerAdapter(nn.Module):
         )
         self.qformer = InstructBlipQFormerModel(config)
         self.vocab_size = config.vocab_size
+
+        # Which layers actually re-read the CF memory. HF inserts cross-attention
+        # where ``layer_idx % cross_attention_frequency == 0``, so this is
+        # (num_layers, cross_attention_frequency) dependent and easy to get wrong
+        # by reasoning alone — logged so it can be CHECKED instead.
+        #
+        # Why the LAST layer matters: whatever the final layer emits is what
+        # out_proj/llm_proj consume, and a layer without cross-attention only
+        # reshuffles the residual stream — where the shared query direction
+        # dominates (measured offdiag_cos ~0.9998 at the output). With
+        # num_layers=4, freq=2 the cross-attention layers are 0 and 2, so layers
+        # 1 and 3 run AFTER the last memory read and can only dilute it further.
+        # num_layers=3 keeps the same two cross-attention layers (0, 2) but makes
+        # layer 2 the LAST one, so the output is refreshed from memory right
+        # before leaving — one fewer layer of parameters, not more.
+        cross_layers = [
+            i for i, layer in enumerate(self.qformer.encoder.layer)
+            if getattr(layer, "has_cross_attention", False)
+        ]
+        LOGGER.info(
+            "Q-Former layers=%d cross_attention_frequency=%d -> cross-attention at "
+            "layers %s; last layer (%d) %s re-read the CF memory.",
+            num_layers, cross_attention_frequency, cross_layers, num_layers - 1,
+            "DOES" if (num_layers - 1) in cross_layers else "does NOT",
+        )
 
         if init_from_pretrained_text:
             self._init_text_branch_from_pretrained_bert(qformer_text_model_name)
@@ -459,17 +512,36 @@ class HFQFormerAdapter(nn.Module):
             )
         return encoder_hidden_states, encoder_attention_mask
 
+    @staticmethod
+    def _pool_source(cf_vec: torch.Tensor, source_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        """One [B, d_cf] summary of the cross-attention source.
+
+        A single item passes through unchanged; a padded history sequence is
+        mask-averaged so padding never enters the mean (``proj_cf`` has a bias,
+        so a zero pad row is NOT neutral — the same trap ``source_mask``
+        exists for on the attention side).
+        """
+        if cf_vec.dim() == 2:
+            return cf_vec
+        if source_mask is None:
+            return cf_vec.mean(dim=1)
+        mask = source_mask.to(cf_vec.dtype).unsqueeze(-1)            # [B,S,1]
+        return (cf_vec * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+
     def _build_query_tokens(
         self,
         batch_size: int,
         user_cf: Optional[torch.Tensor],
+        residual_cf: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Expand base learnable queries and optionally shift per-user.
+        """Expand base learnable queries, then apply up to two per-query shifts.
 
-        When ``user_conditioned`` is on and ``user_cf`` is provided, each query
-        token is shifted by ``user_proj(user_cf)`` so the same Q tokens encode
-        different aspects for different users. Otherwise queries are identical
-        across the batch (vanilla Q-Former behaviour).
+        ``user_cf`` (``user_conditioned``) shifts by the CANDIDATE, so the same
+        history pools differently per candidate. ``residual_cf``
+        (``item_residual``) shifts by a summary of the SOURCE the queries are
+        about to cross-attend to, giving the CF signal a path that skips the
+        body's attenuation. Both are zero-init, so with neither trained the
+        queries are exactly the vanilla shared ones.
         """
         query_tokens = self.q.expand(batch_size, -1, -1)
         if self.user_conditioned and user_cf is not None:
@@ -485,6 +557,14 @@ class HFQFormerAdapter(nn.Module):
                 -1, self.num_queries, self.d_model
             )  # [B, Q, d_model] — a distinct shift per query
             query_tokens = query_tokens + user_cond
+        if self.item_residual and residual_cf is not None:
+            if residual_cf.dim() != 2 or residual_cf.size(0) != batch_size:
+                raise ValueError(
+                    f"Expected residual_cf shape [B, d_cf], got {tuple(residual_cf.shape)}"
+                )
+            query_tokens = query_tokens + self.item_res_proj(residual_cf).view(
+                -1, self.num_queries, self.d_model
+            )
         return query_tokens
 
     def _build_causal_joint_mask(
@@ -531,7 +611,9 @@ class HFQFormerAdapter(nn.Module):
         or raw (contrastive) representation.
         """
         batch_size = cf_vec.size(0)
-        query_tokens = self._build_query_tokens(batch_size, user_cf)
+        query_tokens = self._build_query_tokens(
+            batch_size, user_cf, residual_cf=self._pool_source(cf_vec, source_mask)
+        )
         query_attention_mask = torch.ones(
             batch_size, query_tokens.size(1), dtype=torch.long, device=cf_vec.device
         )
@@ -607,7 +689,9 @@ class HFQFormerAdapter(nn.Module):
         batch_size = cf_vec.size(0)
         text_list = self._normalize_text_input(text, batch_size)
 
-        query_tokens = self._build_query_tokens(batch_size, user_cf)
+        query_tokens = self._build_query_tokens(
+            batch_size, user_cf, residual_cf=self._pool_source(cf_vec, source_mask)
+        )
         query_count = query_tokens.size(1)
 
         text_ids, text_attention_mask = self._tokenize(

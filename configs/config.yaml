@@ -95,13 +95,34 @@ model:
     max_instruction_length: 48
     num_queries: 8
     num_heads: 8
-    num_layers: 4
+    # 3, down from 4 — FEWER parameters and a better-placed memory read, not a
+    # trade. HF inserts cross-attention where layer_idx %
+    # cross_attention_frequency == 0, so at freq=2 the cross-attention layers
+    # are 0 and 2 either way. With 4 layers, layers 1 and 3 run AFTER the last
+    # memory read and can only reshuffle a residual stream where the shared
+    # query direction already dominates (measured offdiag_cos ~0.9998 at the
+    # output). With 3 layers, layer 2 IS the last layer, so the output is
+    # refreshed from the CF memory immediately before out_proj/llm_proj consume
+    # it. Cheaper than cross_attention_frequency=1, which reaches the same
+    # "last layer re-reads memory" property by ADDING cross-attention blocks.
+    # The adapter logs which layers actually got cross-attention at build time —
+    # check that line rather than trusting this comment.
+    num_layers: 3
     user_conditioned: True
-    # Disabled for the clean attribution run: isolates the Q-Former→LLM
-    # alignment (w_align) as the contribution and removes the warm-token
-    # distill dependency (item_llm_emb.pt from the fine-tuned LLM). The
-    # prompt's <Warm_ID> is stripped when False (wrap_prompt_with_soft_tokens_v2).
-    warm_token: False
+    # ON, and it is now load-bearing rather than optional. Dropping
+    # <TargetItemID> from the prompt (see qformer_prompt_movie_mlp_id.txt) also
+    # removed the Q-Former's semantic cross-attention read for the target item,
+    # so <Warm_ID> is the only remaining semantic channel for the candidate —
+    # the one that matters most for cold items, where CF is weak. It reads the
+    # MF's TRAINED item_embedding_llm when available (see _init_warm_token),
+    # not the raw distilled bank.
+    #
+    # Was False to isolate the Q-Former→LLM alignment (w_align) as the sole
+    # contribution; that attribution run no longer applies once the target's
+    # Q-Former path is gone. The prompt's <Warm_ID> is stripped when False
+    # (wrap_prompt_with_soft_tokens_v2), which with the new prompt would leave
+    # the candidate with CF only.
+    warm_token: True
     item_llm_emb_path: "/content/SigLLM/data/processed/ml-1m/item_llm_emb.pt"
     # Second cross-attention source: the same LAST-HIDDEN semantic bank Stage
     # 1/2 trained proj_sem on, fed next to the CF vector so attention balances
@@ -145,6 +166,52 @@ model:
     # the CF slot (mild), and on the history path it adds the candidate as
     # one phantom slot among L (~1/(L+1) mass).
     candidate_fusion: True
+
+    # Residual injection of the CF source straight into the query tokens,
+    # skipping cross-attention. Targets the measured dilution: proj_cf's output
+    # still discriminates items (offdiag_cos 0.70, item-varying/constant 0.66)
+    # while the query OUTPUT sits at ~0.9998, i.e. the body attenuates the
+    # item-specific component ~45x. This gives it a short path in, per query.
+    # Input is the mask-pooled source (the item itself for an S=1 encode, the
+    # padding-masked history mean for <UserProfile>), so it is alive even now
+    # that <TargetItemID> is gone and the history pool is the only Q-Former call.
+    # Complementary to user_conditioned: that shifts by the CANDIDATE, this by
+    # the SOURCE being read. Zero-init, so warm start is an exact no-op.
+    item_residual: True
+
+    # Remove the direction shared across items from the soft tokens, before the
+    # LayerNorm that scales them for injection (llm_proj becomes
+    # Linear -> SharedDirectionCenter -> LayerNorm; a running mean tracked per
+    # query position, subtracted in train and eval alike).
+    #
+    # This is the SECOND HALF of the pair_logit_center fix, and without it the
+    # first half never reaches the LLM: centering the pair logits only changes
+    # what the Stage-1 LOSS can see, while Stage 3 still injects uncentered
+    # tokens — and since llm_proj is Linear+LayerNorm (LayerNorm normalises
+    # across FEATURES within a token, never across items) the shared direction
+    # survives, so every item injects a near-identical vector. Measured at the
+    # query output: offdiag_cos_raw ~0.9998, i.e. the item-specific part is
+    # ~1.4% of the token norm, while proj_cf's own output is still
+    # discriminative (raw offdiag cos 0.70) — the shared direction is added
+    # inside the Q-Former body.
+    #
+    # Simulated on the measured regime, this takes the injected tokens from
+    # offdiag_cos 0.9998 to -0.002 (near-identical -> near-orthogonal) while
+    # mean_l2 stays 1.000, so the injection scale contract holds. Placement sits
+    # between Linear and LayerNorm for robustness, not expressiveness: centering
+    # the Linear's INPUT reaches the same -0.002 (the Linear is linear, and its
+    # bias starts at zero), but leaves that bias as a residual shared component
+    # of training-dependent size. Never AFTER the LayerNorm — that breaks the
+    # mean_l2 ~ 1 scale the 1/sqrt(H) init exists to hold. See
+    # soft_token_proj.SharedDirectionCenter.
+    #
+    # NOTE this shifts the LayerNorm's state_dict keys from 1.* to 2.*. Older
+    # projection exports are migrated automatically (remap_legacy_proj_state),
+    # so Stage-1/2 checkpoints predating this still load; set False to restore
+    # the exact previous layout. Stage 1 mirrors this via
+    # run.qformer_stage1.center_soft_tokens — the two MUST agree, because Stage 2
+    # warm-starts llm_proj from Stage 1's llm_align_proj.
+    center_soft_tokens: True
 
   rec_config:
     user_num: 839
@@ -363,8 +430,35 @@ run:
     # w_itc=0.3 + w_itg=1.0 is the best known pair: ITC damped enough to stop
     # dominating, ITG left strong enough to keep the representation open.
     w_itg: 1.0
-    w_ii: 1.0
+    # 0.3, down from 1.0. MEASURED CEILING: item_item InfoNCE computed directly
+    # on the raw MF embeddings (diagnose_collab_collapse.py, n=610 to match
+    # n_ii) tops out at gain +0.167 nats out of ln(610)=6.41 — 2.6% of the
+    # headroom — with top1 0.0146 vs chance 0.00164 (8.9x). Stage 1 already
+    # reaches +0.142, i.e. it is AT that ceiling. The co-watch signal simply is
+    # not in the MF geometry: MF optimises e_u . e_i, and "both items score high
+    # against the same user" is a weak constraint on e_i . e_j in 256 dims, so
+    # item-item similarity is only a second-order effect. Kept non-zero because
+    # config records L_ii/L_ui as anti-collapse pressure on the shared body and
+    # a past run died when these weights were cut — but it cannot deliver gain,
+    # so it should not spend full weight. To raise it, add an item-item term to
+    # the MF training (Stage 0), not to Stage 1.
+    w_ii: 0.3
     w_ui: 1.0
+    # Batch-center the pooled pair logits. Flipped from False after a direct
+    # measurement that CONTRADICTS the earlier verdict below (kept for the
+    # record): centering was rejected on evidence collected at tau=0.07, where
+    # raw and centered are BOTH catastrophic, so the comparison was confounded
+    # by tau. On the raw-MF ceiling for the history-pooled user side:
+    #
+    #      user_item(hist)   tau=0.07   tau=0.2    best top1
+    #      raw                -1.048    +0.183     0.0193  (6.5x chance)
+    #      centered           -0.835    +0.497     0.0461  (15.6x chance)
+    #
+    # i.e. at tau=0.2 centering is 2.7x better on gain and 2.5x on top1. Must
+    # be changed TOGETHER with tau_ui/tau_ii below — centering at tau=0.07
+    # reproduces the old failure (bipolar cosines x 1/tau blow the logsumexp up;
+    # the previously recorded L_ii=24.45 vs ln(n)=6.41).
+    pair_logit_center: True
     # Candidate-conditioned pairwise BPR ADDED to the ui InfoNCE — the term
     # that pretrains user_proj (Stage 3's target-conditioned history pooling).
     # Scored on mean-pooled queries at a soft temperature: the first version
@@ -422,6 +516,10 @@ run:
     # stay w_ii / w_ui). Val L_ii swings ~+-1.2 nats and val L_ui ~+-0.9 nats
     # epoch-to-epoch; at full weight that noise decided every late-epoch
     # selection verdict in the 34-epoch run.
+    #
+    # NOTE these feed val_L_repr, which is NOT the active selection metric
+    # (selection_metric: val_gain_repr below, weighted by select_collab_weight).
+    # They are kept for the legacy metric only.
     select_w_ii: 0.3
     select_w_ui: 0.3
     # Checkpoint selection on the CF-ONLY ITC gain from the fixed-n diagnostic
@@ -509,15 +607,20 @@ run:
     selection_ema: 0.5
     # Single-batch spikes were walking train loss upward late in the run.
     grad_clip_norm: 1.0
-    # Batch-centering for the collaborative InfoNCE (L_ii / L_ui). OFF, measured:
-    # ON gave L_ii=24.45 against ln(n)=6.41 and L_ui=9.56 vs 5.86 — worse than
-    # chance, because the centered residual is near low-rank, the cosines go
-    # bipolar, and cross_entropy's logsumexp amplifies that by 1/tau. Turning it
-    # off moved g_ii from -18.04 to -4.03 and g_ui from -3.70 to +0.72 in the
-    # same epoch. Do NOT also replace the pooling with a max over the Q x Q
-    # query grid: that lets max_{q,r} lock onto q == r (cosine ~1 for any pair
-    # of inputs) and pins the loss at exactly ln(n).
-    pair_logit_center: False
+    # pair_logit_center is set ABOVE, next to w_ii/w_ui, together with the
+    # tau_ii/tau_ui it must move with. It used to be duplicated here, and a
+    # duplicate YAML key silently takes its LAST value — so the flag read False
+    # no matter what the earlier entry said.
+    #
+    # Historical rationale for the old False, kept because it is still true AT
+    # tau=0.07: centering there gave L_ii=24.45 against ln(n)=6.41 and L_ui=9.56
+    # vs 5.86 (g_ii -18.04, g_ui -3.70) — the centered residual is near
+    # low-rank, the cosines go bipolar, and cross_entropy's logsumexp amplifies
+    # that by 1/tau. What the measurement above adds is that RAW at tau=0.07 is
+    # also worse than chance (-1.05), so that comparison never isolated
+    # centering. Still true regardless of tau: do NOT replace the pooling with a
+    # max over the Q x R grid — max_{q,r} locks onto q == r (cosine ~1 for any
+    # pair of inputs) and pins the loss at exactly ln(n).
     itc_logit_center: True
     # Batch-centering for the candidate-conditioned BPR. ON — this loss fails
     # the OPPOSITE way to the InfoNCE above, which is why it needs its own flag.
@@ -543,8 +646,23 @@ run:
     # llm_proj — see best_align_proj_weights_name / run.qformer_stage2.proj_ckpt_in.
     w_llm: 1.0
     tau_itc: 0.07
-    tau_ii: 0.07
-    tau_ui: 0.07
+    # tau_ii / tau_ui: 0.07 -> 0.5 / 0.2. These are NOT a free choice: tau must
+    # match the spread of the cosine distribution being scored, and 0.07 was
+    # inherited from tau_itc where the other side is a single vector. Measured on
+    # the raw-MF ceiling (diagnose_collab_collapse.py), gain by tau:
+    #
+    #      item_item      (centered)   0.07: -2.656   0.2: +0.140   0.5: +0.167
+    #      user_item(hist)(centered)   0.07: -0.835   0.2: +0.497   0.5: +0.334
+    #
+    # At 0.07 BOTH terms score WORSE THAN CHANCE on clean embeddings — the loss
+    # was pointing the gradient the wrong way, and the only reason Stage 1 still
+    # showed a small positive gain is that the collapsed Q-Former output
+    # (offdiag_cos_raw ~0.9998) squeezes every logit together and so hides the
+    # logsumexp blowup. Two bugs masking each other. Read together with
+    # pair_logit_center above; changing one without the other is worse than
+    # changing neither.
+    tau_ii: 0.5
+    tau_ui: 0.2
     # Softer than the other contrastives: even after centering, input-space
     # targets keep residual correlation (shared genres), and tau=0.07 was
     # too sharp — LLM@1 sat at chance (~0.003) while ITC@1 learned.
@@ -558,10 +676,19 @@ run:
     # selection, which attacks the same plateau without bending the target
     # space. Revisit whiten only if L_llm still cannot fit TRAIN targets.
     llm_emb_normalize: center
+    # Mirror of model.qformer_config.center_soft_tokens. MUST match it: Stage 2
+    # warm-starts llm_proj from the llm_align_proj exported here under a strict
+    # load, so a disagreement changes the layout the export has to fit.
+    center_soft_tokens: ${model.qformer_config.center_soft_tokens}
     # Mirror of model.qformer_config.user_conditioned: builds user_proj in the
     # Stage-1 adapter and pretrains it via the candidate-conditioned (DIN-style)
     # user-item BPR, so it does not reach Stage 3 at its zero init.
     user_conditioned: ${model.qformer_config.user_conditioned}
+    # Adapter SHAPE flags — must mirror model.qformer_config.*, because the
+    # Q-Former checkpoint flows stage1 -> stage2 -> stage3 under a STRICT load
+    # and these add/remove modules (fuse_cf, fuse_user, item_res_proj).
+    candidate_fusion: ${model.qformer_config.candidate_fusion}
+    item_residual: ${model.qformer_config.item_residual}
     # Semantic second cross-attention source (reuses item_llm_emb_path below).
     sem_source: ${model.qformer_config.sem_source}
     sem_source_dropout: ${model.qformer_config.sem_source_dropout}
@@ -673,6 +800,14 @@ run:
     # strict checkpoint load to Stage 3), and the semantic source stays active
     # so the generative objective trains the same two-source attention.
     user_conditioned: ${model.qformer_config.user_conditioned}
+    # Adapter SHAPE flags — must mirror model.qformer_config.*, because the
+    # Q-Former checkpoint flows stage1 -> stage2 -> stage3 under a STRICT load
+    # and these add/remove modules (fuse_cf, fuse_user, item_res_proj).
+    candidate_fusion: ${model.qformer_config.candidate_fusion}
+    item_residual: ${model.qformer_config.item_residual}
+    # Must match Stage 1 and Stage 3 — llm_proj is warm-started from Stage 1's
+    # llm_align_proj here and exported to Stage 3 under a strict load.
+    center_soft_tokens: ${model.qformer_config.center_soft_tokens}
     sem_source: ${model.qformer_config.sem_source}
     # Semantic SOURCE bank — same file Stage 1 trained proj_sem on (last-
     # hidden), distinct from the item_llm_emb_path target bank above.
@@ -748,7 +883,13 @@ run:
     # the blocker; a large drop means the soft tokens cannot yet substitute for
     # the titles, which points back at Stage 1/2 quality rather than the prompt.
     # Revert with --options run.qformer_stage3_step1.prompt_path=<full prompt>.
-    prompt_path: "/content/SigLLM/prompts/qformer_prompt_movie_no_hist_text.txt"
+    #   mlp_id_no_hist_text (current) — same as no_hist_text, but with the Step-2
+    #                    SOFT-TOKEN LAYOUT: <TargetItemID> removed, <UserID> /
+    #                    <ItemID> / <Warm_ID> added (11 slots, not 17). Step 1
+    #                    must train LoRA against the layout Step 2 serves, or
+    #                    LoRA learns to read a channel that then changes shape —
+    #                    the same class of skew as the text-shortcut above.
+    prompt_path: "/content/SigLLM/prompts/qformer_prompt_movie_mlp_id_no_hist_text.txt"
     output_dir: "/content/SigLLM/ckpt/qformer_stage3_step1_lora_qwen2/"
     best_ckpt_name: "checkpoint_best.pth"
     init_lr: 8e-5
@@ -764,10 +905,16 @@ run:
     # `qformer_stage3_step1`: only the keys that differ from the top-level
     # defaults are listed here.
     #
-    # direct_id prompt: full prompt + the SeLLa <UserID>/<ItemID> single-token
-    # slots (see model.direct_id_tokens). Revert to qformer_prompt_movie.txt
-    # to run without the direct path.
-    prompt_path: "/content/SigLLM/prompts/qformer_prompt_movie_direct_id.txt"
+    # mlp_id prompt: <TargetItemID> REMOVED. The Q-Former keeps only the job an
+    # MLP cannot do (pooling variable-length history into <UserProfile>), while
+    # identity and interaction go to the 1-token id_proj slots <UserID> /
+    # <ItemID>, and the candidate's semantics to <Warm_ID>. 11 soft tokens
+    # instead of 19, and the Q x target encode disappears. Rationale in the
+    # prompt file's trailing comments.
+    #   qformer_prompt_movie_direct_id.txt  keeps <TargetItemID> alongside
+    #                                       <ItemID> (both fed the same e_t)
+    #   qformer_prompt_movie.txt            neither id slot; Q-Former only
+    prompt_path: "/content/SigLLM/prompts/qformer_prompt_movie_mlp_id.txt"
     output_dir: "/content/SigLLM/ckpt/qformer_stage3_step2_cie_qwen2/"
     ckpt: "${run.qformer_stage3_step1.output_dir}${run.qformer_stage3_step1.best_ckpt_name}"
     init_lr: 3e-5
@@ -793,7 +940,10 @@ run:
     # frozen. Steps 1 and 2 each freeze what the other trains, so neither lets
     # the CF encoder co-adapt with the channel that reads it; this step does.
     # Run it AFTER step 1 (and optionally step 2), never instead of them.
-    prompt_path: "/content/SigLLM/prompts/qformer_prompt_movie.txt"
+    # Same prompt as Step 2 — Step 3 is the JOINT variant of Step 2, so a
+    # different soft-token layout here would make the two unattributable (and
+    # would feed LoRA, warm-started from Step 1, a channel of another shape).
+    prompt_path: "/content/SigLLM/prompts/qformer_prompt_movie_mlp_id.txt"
     output_dir: "/content/SigLLM/ckpt/qformer_stage3_step3_joint_qwen2/"
     best_ckpt_name: "checkpoint_best.pth"
     # Which checkpoint to warm-start from: step1 | step2.
