@@ -233,6 +233,82 @@ def probe_split(split, enc):
     return results
 
 
+def build_probe_loader(dataset_cfg, filename, batch_size=64):
+    """Loader over a MovieOOD split, shaped for ``encode_split``.
+
+    Exposed so Stage 1 can build this once at setup and probe DURING training
+    instead of only after the fact.
+    """
+    return DataLoader(
+        MovieOODDataset(dataset_cfg, filename=filename),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate,
+    )
+
+
+@torch.no_grad()
+def probe_metrics(qformer, mf, sem_bank, loader, device, prefix="val_probe"):
+    """The probe as a flat metrics dict, for in-training use.
+
+    WHY THIS IS THE METRIC THAT MATTERS. Every metric Stage 1 optimises is a
+    CROSS-USER retrieval pretext (L_ii, L_ui: pick this user's item out of other
+    users' items), but the number the project is judged on is uAUC — WITHIN-user
+    ranking of one user's own candidates. Those are different tasks, and the gap
+    is not academic: measured on the val pkl, the parameter-free readout over
+    the frozen MF embeddings scores ~+0.05 nats on the retrieval pretext (barely
+    above chance) while that same MF ranks held-out candidates at 0.708 uAUC.
+    A pretext can therefore look degenerate while the underlying signal is fine,
+    and conversely it can be driven up by memorisation while uAUC does not move.
+
+    Returns ``{prefix}_uauc`` / ``_auc`` (Q-Former cosine, the channel Stage 3
+    consumes), the same centered, the MF references on the IDENTICAL rows, and
+    ``{prefix}_gain`` = Q-Former uAUC - MF-dot uAUC. That last one is the honest
+    summary: positive means Stage 1 added something the MF it was built from did
+    not already have.
+    """
+    was_training = qformer.training
+    qformer.eval()
+    try:
+        enc = encode_split(qformer, mf, sem_bank, loader, device)
+    finally:
+        if was_training:
+            qformer.train()
+
+    users = enc["user"].numpy()
+    labels = enc["label"].numpy()
+
+    def uauc(scores):
+        value, _, _ = calculate_user_auc(users, np.asarray(scores, dtype=np.float64), labels)
+        return float(value)
+
+    def auc(scores):
+        return float(roc_auc_score(labels, np.asarray(scores, dtype=np.float64)))
+
+    qf_raw = _cosine(enc["profile_q"], enc["target_q"]).numpy()
+    pc = enc["profile_q"] - enc["profile_q"].mean(0, keepdim=True)
+    tc = enc["target_q"] - enc["target_q"].mean(0, keepdim=True)
+    qf_cen = _cosine(pc, tc).numpy()
+    mf_dot = (enc["mf_user"] * enc["mf_item"]).sum(-1).numpy()
+
+    out = {
+        f"{prefix}_uauc": uauc(qf_raw),
+        f"{prefix}_auc": auc(qf_raw),
+        f"{prefix}_uauc_centered": uauc(qf_cen),
+        f"{prefix}_mf_dot_uauc": uauc(mf_dot),
+        f"{prefix}_mf_hist_cos_uauc": uauc(_cosine(enc["mf_hist"], enc["mf_item"]).numpy()),
+        f"{prefix}_rows": float(labels.size),
+    }
+    # Best of raw/centered vs MF: which of the two the loss happens to favour is
+    # an implementation detail of the scoring head, not of the channel.
+    out[f"{prefix}_gain"] = (
+        max(out[f"{prefix}_uauc"], out[f"{prefix}_uauc_centered"])
+        - out[f"{prefix}_mf_dot_uauc"]
+    )
+    return out
+
+
 def main():
     args = parse_args()
     cfg = Config(argparse.Namespace(cfg_path=args.cfg_path, options=args.options))

@@ -600,6 +600,28 @@ run:
     # scores with. All three are `gain` values (ln(n) - L) so they are already
     # normalised by their own chance level and can be summed.
     # On the ep1-46 run: peak at ep16 (0.615), ep46 only 0.327.
+    # In-training uAUC probe — the ONLY Stage-1 metric measured on the task the
+    # project is judged on (WITHIN-user ranking), as opposed to every other
+    # metric here, which scores a CROSS-USER retrieval pretext. The two come
+    # apart badly: measured on the val pkl, a parameter-free readout over the
+    # frozen MF embeddings scores only ~+0.05 nats on the retrieval pretext
+    # (barely above chance) while that same MF ranks held-out candidates at
+    # 0.708 uAUC. So g_ii / g_ui can look degenerate while the signal is fine,
+    # and can be driven up by memorisation (observed train g_ui >0.67 vs val
+    # ~0.14) without uAUC moving at all.
+    #
+    # Logs val_probe_uauc / _uauc_centered against val_probe_mf_dot_uauc on the
+    # SAME rows, plus val_probe_gain = best(channel) - MF. Costs one forward over
+    # the [B, L] history per eval row, so ~10-30s/epoch — set 0 to disable, or 2-3
+    # to amortise it.
+    probe_every_epochs: 1
+    probe_split: valid_ood2.pkl
+    probe_batch_size: 64
+    # Selection stays on val_gain_repr for now, deliberately: val_probe_gain is a
+    # uAUC DELTA whose epoch-to-epoch noise has not been characterised yet, and
+    # swapping the selection metric and the architecture in the same run would make
+    # the result unattributable. Read the probe for a few runs first, then switch
+    # to `selection_metric: val_probe_gain` — that is what Stage 3 consumes.
     selection_metric: val_gain_repr
     selection_mode: max
     # Weight on EACH collaborative gain in the composite. 0.5 keeps the

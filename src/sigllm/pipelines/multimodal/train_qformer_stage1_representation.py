@@ -15,6 +15,7 @@ from sigllm.datasets.qformer.qformer_loader import build_qformer_loader, build_q
 from sigllm.models.rec.matrix_factorization import MatrixFactorization
 from sigllm.models.q_former.hf_qformer_adapter import HFQFormerAdapter
 from sigllm.models.projection.qformer_alignment_model import QRecInstructAlignmentModel
+from sigllm.pipelines.multimodal.probe_cf_channel import build_probe_loader, probe_metrics
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -873,6 +874,63 @@ def train_qformer_stage1_representation(cfg):
                 f"{diag_every} epoch(s)",
             )
 
+    # uAUC probe: the ONE in-training metric measured on the task the project is
+    # judged on. Everything else Stage 1 optimises is a CROSS-USER retrieval
+    # pretext (L_ii / L_ui: pick this user's item out of other users' items),
+    # while the target metric is WITHIN-user ranking. Those come apart badly:
+    # measured on the val pkl, the parameter-free readout over the frozen MF
+    # embeddings scores only ~+0.05 nats on the retrieval pretext — barely above
+    # chance — yet the same MF ranks held-out candidates at 0.708 uAUC. So a
+    # pretext number can look degenerate while the signal is fine, and it can be
+    # driven up by memorisation (train g_ui >0.67 against val ~0.14) while uAUC
+    # never moves. This probe closes that blind spot without the LLM: it scores
+    # pool(qformer(history)) . pool(qformer(target)) on real eval rows and
+    # reports the delta against the MF dot product on the SAME rows.
+    #
+    # Set run.qformer_stage1.selection_metric: val_probe_gain to select the
+    # checkpoint on "does the channel beat the MF it was built from".
+    probe_every = int(cfg.get("probe_every_epochs", 0))
+    probe_uauc_loader = None
+    if probe_every > 0:
+        if cfg.get("dataset_cfg") is None:
+            log_step(
+                "WARNING",
+                "probe_every_epochs > 0 but no dataset_cfg was passed; the uAUC "
+                "probe needs it to build MovieOODDataset. Probe DISABLED.",
+            )
+            probe_every = 0
+        else:
+            probe_uauc_loader = build_probe_loader(
+                cfg.dataset_cfg,
+                str(cfg.get("probe_split", "valid_ood2.pkl")),
+                batch_size=int(cfg.get("probe_batch_size", 64)),
+            )
+            log_step(
+                "uAUC probe enabled",
+                f"split={cfg.get('probe_split', 'valid_ood2.pkl')}, "
+                f"rows={len(probe_uauc_loader.dataset)}, every {probe_every} epoch(s). "
+                f"Reports val_probe_uauc / _uauc_centered vs val_probe_mf_dot_uauc, "
+                f"and val_probe_gain = best(channel) - MF.",
+            )
+
+    def run_uauc_probe(epoch_index):
+        if probe_uauc_loader is None:
+            return {}
+        out = probe_metrics(
+            model.qformer, model.mf, model.item_sem_emb, probe_uauc_loader, device
+        )
+        log_step(
+            f"[DIAG ep{epoch_index}] uAUC probe (within-user, the real task)",
+            f"channel_uauc={out['val_probe_uauc']:.4f} "
+            f"centered={out['val_probe_uauc_centered']:.4f} | "
+            f"MF_dot={out['val_probe_mf_dot_uauc']:.4f} "
+            f"MF_hist_cos={out['val_probe_mf_hist_cos_uauc']:.4f} | "
+            f"GAIN={out['val_probe_gain']:+.4f} over MF on {int(out['val_probe_rows'])} rows "
+            f"| gain <= 0 means Stage 1 has not beaten the MF it was built from, "
+            f"whatever g_ii/g_ui say",
+        )
+        return out
+
     def run_diagnostics(epoch_index):
         """Fixed-n item_text metrics, with the semantic source on and off.
 
@@ -1120,8 +1178,10 @@ def train_qformer_stage1_representation(cfg):
             # BEFORE building `metrics`: the diagnostic publishes the fixed-n
             # sem_on/sem_off keys that checkpoint selection may depend on.
             diag_metrics = {}
-            if item_text_loaders and (epoch + 1) % diag_every == 0:
+            if item_text_loaders and diag_every > 0 and (epoch + 1) % diag_every == 0:
                 diag_metrics = run_diagnostics(epoch + 1)
+            if probe_every > 0 and (epoch + 1) % probe_every == 0:
+                diag_metrics.update(run_uauc_probe(epoch + 1))
 
             metrics = {
                 "epoch": epoch + 1,
@@ -1375,6 +1435,10 @@ def main():
 
     first_dataset_key = list(cfg.datasets_cfg.keys())[0]
     stage1_cfg.data_dir = cfg.datasets_cfg[first_dataset_key].path
+    # The uAUC probe reuses MovieOODDataset, which reads min_positive_history /
+    # max_history_length / warm_definition off the DATASET config, so the whole
+    # node has to travel — data_dir alone is not enough.
+    stage1_cfg.dataset_cfg = cfg.datasets_cfg[first_dataset_key]
 
     train_qformer_stage1_representation(stage1_cfg)
 
