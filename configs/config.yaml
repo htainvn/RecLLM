@@ -639,6 +639,30 @@ run:
     # SAME rows, plus val_probe_gain = best(channel) - MF. Costs one forward over
     # the [B, L] history per eval row, so ~10-30s/epoch — set 0 to disable, or 2-3
     # to amortise it.
+    # WITHIN-USER BPR — the one Stage-1 loss that optimises the metric the
+    # project is judged on. Measured motivation: the channel's within-user uAUC
+    # FELL 0.583 -> 0.532 over three epochs while every internal metric rose,
+    # because not one existing term asks 'within this user's candidates, is the
+    # liked one ranked higher'. 2.3 of the 3.9 total loss weight pulls the query
+    # output toward CAPTION reconstruction (w_itc 0.3 + w_itg 1.0 + w_llm 1.0),
+    # for which the ranking signal is interference to be cancelled; the rest is
+    # CROSS-user retrieval, whose val ceiling is ~0.05 nats.
+    #
+    # Scored on exactly what the probe and Stage 3 read: pool(profile_q) .
+    # pool(target_q), with the output residual left ON (the caption losses are
+    # now shielded from it instead). Replayed from its own loader because the
+    # qformer pkl carries POSITIVES only, and via UserGroupedSampler because a
+    # batch without same-user pos/neg pairs makes the loss silently return 0.
+    #
+    # 0.0 disables (exact previous behaviour). Start at 1.0: it should be
+    # comparable to w_ui, which it is meant to correct rather than replace.
+    # It fits HELD-IN labels so it can memorise — judge it by val_probe_gain,
+    # not by its own train value or rank_acc.
+    w_rank: 1.0
+    tau_rank: 1.0
+    rank_split: train_ood2.pkl
+    rank_batch_size: 64
+    rank_items_per_user: 8
     probe_every_epochs: 1
     probe_split: valid_ood2.pkl
     probe_batch_size: 64

@@ -633,7 +633,7 @@ class HFQFormerAdapter(nn.Module):
         mask[:, query_count:, :] = mask[:, query_count:, :] * row_pad
         return mask
 
-    def _apply_output_residual(self, query_hidden, pooled_cf):
+    def _apply_output_residual(self, query_hidden, pooled_cf, apply=True):
         """query_hidden + res_gain * normalize(R @ pooled_cf), broadcast over Q.
 
         Applied to the raw query hidden states, BEFORE ``out_proj``. In the
@@ -649,7 +649,7 @@ class HFQFormerAdapter(nn.Module):
         SharedDirectionCenter is there to handle. What matters is that it varies
         per ITEM, which it does.
         """
-        if not self.output_residual or pooled_cf is None:
+        if not self.output_residual or pooled_cf is None or not apply:
             return query_hidden
         res = self.out_res_proj(pooled_cf.to(self.out_res_proj.weight.dtype))
         res = torch.nn.functional.normalize(res, dim=-1) * self.res_gain
@@ -665,6 +665,7 @@ class HFQFormerAdapter(nn.Module):
         fusion_user: Optional[torch.Tensor] = None,
         slot_target: Optional[torch.Tensor] = None,
         residual_vec: Optional[torch.Tensor] = None,
+        apply_residual: bool = True,
     ) -> torch.Tensor:
         """Queries-only forward over a CF (collaborative filtering) vector.
 
@@ -697,6 +698,7 @@ class HFQFormerAdapter(nn.Module):
         return self._apply_output_residual(
             outputs.last_hidden_state,
             residual_vec if residual_vec is not None else self._pool_source(cf_vec, source_mask),
+            apply=apply_residual,
         )
 
     def encode_text(
@@ -740,6 +742,7 @@ class HFQFormerAdapter(nn.Module):
         fusion_user: Optional[torch.Tensor] = None,
         slot_target: Optional[torch.Tensor] = None,
         residual_vec: Optional[torch.Tensor] = None,
+        apply_residual: bool = True,
     ):
         """Joint forward returning ``(query_hidden, text_hidden, text_ids, text_mask)``.
 
@@ -800,6 +803,7 @@ class HFQFormerAdapter(nn.Module):
         query_hidden = self._apply_output_residual(
             sequence_hidden[:, :query_count],
             residual_vec if residual_vec is not None else self._pool_source(cf_vec, source_mask),
+            apply=apply_residual,
         )
         text_hidden = sequence_hidden[:, query_count:]
         return query_hidden, text_hidden, text_ids, text_attention_mask
@@ -815,6 +819,7 @@ class HFQFormerAdapter(nn.Module):
         fusion_user: Optional[torch.Tensor] = None,
         slot_target: Optional[torch.Tensor] = None,
         residual_vec: Optional[torch.Tensor] = None,
+        apply_residual: bool = True,
     ) -> torch.Tensor:
         """LLM-feeding mode: queries cross-attend to ``cf_vec`` (and the
         optional ``sem_vec`` semantic source) while the text stream consumes
@@ -832,5 +837,6 @@ class HFQFormerAdapter(nn.Module):
             fusion_user=fusion_user,
             slot_target=slot_target,
             residual_vec=residual_vec,
+            apply_residual=apply_residual,
         )
         return self.out_proj(query_hidden)

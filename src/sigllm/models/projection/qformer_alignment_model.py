@@ -10,6 +10,56 @@ from sigllm.models.projection.soft_token_proj import build_soft_token_projection
 LLM_EMB_NORMALIZERS = ("none", "center", "whiten")
 
 
+def _per_user_pairwise_loss(scores, users, labels, tau=1.0):
+    """-log sigmoid((s_pos - s_neg)/tau) over same-user pairs, USER-weighted.
+
+    Mirrors ``QRecLLM._per_user_pairwise_loss``: pair losses are averaged WITHIN
+    each user first, then across users, so the objective matches uAUC (which
+    weights users equally) rather than global AUC (which would weight users by
+    their pair count). Returns a graph-preserving 0 when a batch holds no valid
+    same-user pos/neg pair, so unlucky batches cannot NaN the run.
+    """
+    users = users.view(-1)
+    labels = labels.view(-1).long()
+    pos_mask = labels == 1
+    neg_mask = labels == 0
+
+    diff = scores.unsqueeze(1) - scores.unsqueeze(0)
+    valid = (users.unsqueeze(1) == users.unsqueeze(0)) & pos_mask.unsqueeze(1) & neg_mask.unsqueeze(0)
+    if valid.sum() == 0:
+        return scores.sum() * 0.0
+
+    valid_f = valid.to(scores.dtype)
+    pair_losses = F.softplus(-diff / tau) * valid_f
+    row_loss = pair_losses.sum(dim=1)
+    row_count = valid_f.sum(dim=1)
+
+    uniq, inv = torch.unique(users, return_inverse=True)
+    inv = inv.to(scores.device)
+    loss_sum = torch.zeros(uniq.numel(), dtype=scores.dtype, device=scores.device)
+    cnt = torch.zeros(uniq.numel(), dtype=scores.dtype, device=scores.device)
+    loss_sum.scatter_add_(0, inv, row_loss)
+    cnt.scatter_add_(0, inv, row_count)
+    has = cnt > 0
+    return (loss_sum[has] / cnt[has]).mean()
+
+
+@torch.no_grad()
+def _per_user_pairwise_acc(scores, users, labels):
+    """Fraction of same-user (pos, neg) pairs ordered correctly — a direct,
+    unsmoothed read of uAUC on this batch. Reported next to the loss because the
+    loss value alone cannot be compared to chance; this can (0.5 = chance)."""
+    users = users.view(-1)
+    labels = labels.view(-1).long()
+    diff = scores.unsqueeze(1) - scores.unsqueeze(0)
+    valid = (users.unsqueeze(1) == users.unsqueeze(0)) & (labels == 1).unsqueeze(1) & (labels == 0).unsqueeze(0)
+    total = valid.sum()
+    if total == 0:
+        return float("nan")
+    correct = ((diff > 0) & valid).sum() + 0.5 * ((diff == 0) & valid).sum()
+    return float(correct / total)
+
+
 def normalize_item_llm_emb(emb: torch.Tensor, mode: str = "center") -> torch.Tensor:
     """Condition the frozen item-LLM embedding bank for the cosine InfoNCE.
 
@@ -268,7 +318,17 @@ class QRecInstructAlignmentModel(nn.Module):
         L_llm via loss_llm_align). Uses ``_sem_for_text_loss``, so by default the
         semantic bank is withheld here — see that method for why."""
         item_cf = self.mf.item_encoder(item_ids)
-        return self.qformer.encode_cf(item_cf, sem_vec=self._sem_for_text_loss(item_ids))
+        # apply_residual=False: this path feeds the CAPTION-targeted losses
+        # (ITC, L_llm). They see body+residual otherwise, and since the fixed
+        # random projection of e_u/e_t is pure interference for "reproduce this
+        # item's caption", the cheapest way for them to improve is to CANCEL it —
+        # measured as the channel's within-user uAUC falling 0.583 -> 0.532 over
+        # three epochs while every caption metric rose. The residual is a
+        # serving-time bypass for the ranking task; the caption losses must not
+        # be able to reach it.
+        return self.qformer.encode_cf(
+            item_cf, sem_vec=self._sem_for_text_loss(item_ids), apply_residual=False
+        )
 
     def encode_text_cls(self, text_list) -> torch.Tensor:
         _, text_cls = self.qformer.encode_text(text_list)
@@ -374,6 +434,7 @@ class QRecInstructAlignmentModel(nn.Module):
         query_hidden, _, _, _ = self.qformer.forward_multimodal(
             cf_concat, text_concat, causal_text=False,
             sem_vec=self._sem_for_text_loss(ids_concat),
+            apply_residual=False,   # ITM is caption-targeted; see encode_item_queries
         )
         pooled = query_hidden.mean(dim=1)
         logits = self.itm_head(pooled)
@@ -444,6 +505,7 @@ class QRecInstructAlignmentModel(nn.Module):
         _, text_hidden, text_ids, text_attention_mask = self.qformer.forward_multimodal(
             item_cf, text_list, causal_text=True,
             sem_vec=self._sem_for_text_loss(item_ids),
+            apply_residual=False,   # ITG is caption-targeted; see encode_item_queries
         )
 
         logits = self.lm_head(text_hidden[:, :-1, :])
@@ -751,6 +813,55 @@ class QRecInstructAlignmentModel(nn.Module):
                 cond_acc = (s_pos[valid] > s_neg[valid]).float().mean()
 
         return loss, accuracy, cond_loss, cond_acc
+
+    def loss_user_rank(
+        self,
+        user_ids: torch.Tensor,
+        item_ids: torch.Tensor,
+        labels: torch.Tensor,
+        history_ids,
+        tau: float = 1.0,
+    ):
+        """Per-user pairwise BPR on the channel's own readout — a uAUC surrogate.
+
+        THE GAP THIS FILLS. Every other Stage-1 loss optimises either a CROSS-user
+        retrieval pretext (L_ii, L_ui: pick this user's item out of other users'
+        items) or caption reconstruction (ITC, ITG, L_llm). NOT ONE of them asks
+        the question the project is judged on: within a single user's candidates,
+        is the liked one ranked above the disliked one. That is why the measured
+        within-user uAUC of the channel FELL while every internal metric rose —
+        it was nobody's objective, so the other terms were free to spend the
+        representation on theirs.
+
+        Scored on exactly what the probe (and Stage 3) reads:
+        ``pool(profile_q) . pool(target_q)``, with the user side pooled from the
+        padded HISTORY through the same multi-source path <UserProfile> uses, and
+        the output residual left ON (unlike the caption losses, which are now
+        shielded from it) because preserving that fallback readout is the point.
+
+        Labels are the real CTR labels of held-in rows, so this can memorise —
+        watch it against the val probe rather than its own train value, exactly
+        as with L_ui. The pairing is done by ``_per_user_pairwise_loss``, the same
+        helper Stage 3 uses for ``ranking_loss``, so batches must carry several
+        rows per user with mixed labels (see UserGroupedSampler).
+        """
+        user_src, user_mask, user_sem = self._user_source(user_ids, history_ids)
+        item_cf = self.mf.item_encoder(item_ids)
+
+        profile_q = self.qformer.encode_cf(
+            user_src,
+            user_cf=item_cf if self.qformer.user_conditioned else None,
+            source_mask=user_mask,
+            sem_vec=user_sem,
+            residual_vec=self.mf.user_encoder(user_ids),
+        )
+        target_q = self.qformer.encode_cf(item_cf, sem_vec=self._sem_for(item_ids))
+
+        scores = (profile_q.mean(dim=1) * target_q.mean(dim=1)).sum(dim=-1)
+        loss = _per_user_pairwise_loss(scores, user_ids, labels, tau)
+        with torch.no_grad():
+            acc = _per_user_pairwise_acc(scores, user_ids, labels)
+        return loss, acc
 
     def loss_llm_align(self, item_ids: torch.Tensor, tau: float = 0.07, symmetric: bool = True):
         if not self.has_llm_align:

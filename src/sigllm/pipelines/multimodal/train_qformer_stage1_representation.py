@@ -15,7 +15,12 @@ from sigllm.datasets.qformer.qformer_loader import build_qformer_loader, build_q
 from sigllm.models.rec.matrix_factorization import MatrixFactorization
 from sigllm.models.q_former.hf_qformer_adapter import HFQFormerAdapter
 from sigllm.models.projection.qformer_alignment_model import QRecInstructAlignmentModel
-from sigllm.pipelines.multimodal.probe_cf_channel import build_probe_loader, probe_metrics
+from sigllm.datasets.movie.movie_ood_dataset import MovieOODDataset
+from sigllm.pipelines.multimodal.probe_cf_channel import (
+    build_probe_loader,
+    collate as probe_collate,
+    probe_metrics,
+)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -921,6 +926,49 @@ def train_qformer_stage1_representation(cfg):
                 f"and val_probe_gain = best(channel) - MF.",
             )
 
+    # Within-user BPR (uAUC surrogate) on real CTR rows. THE gap it fills: not
+    # one existing Stage-1 loss asks "within this user's candidates, is the liked
+    # one ranked higher" — they all score cross-user retrieval or caption
+    # reconstruction. That is why the measured channel uAUC FELL from 0.583 to
+    # 0.532 over three epochs while every internal metric rose: it was nobody's
+    # objective. Needs its own loader (the qformer pkl has positives only) and a
+    # USER-GROUPED sampler, or batches hold no same-user pos/neg pair and the
+    # loss silently returns 0.
+    w_rank = float(cfg.get("w_rank", 0.0))
+    tau_rank = float(cfg.get("tau_rank", 1.0))
+    rank_loader = None
+    rank_iter = None
+    if w_rank > 0.0:
+        if cfg.get("dataset_cfg") is None:
+            log_step("WARNING", "w_rank > 0 but no dataset_cfg; BPR DISABLED.")
+            w_rank = 0.0
+        else:
+            from sigllm.common.user_grouped_sampler import UserGroupedSampler
+            from torch.utils.data import DataLoader as _DL
+
+            rank_ds = MovieOODDataset(cfg.dataset_cfg, filename=str(cfg.get("rank_split", "train_ood2.pkl")))
+            uids = [int(r) for r in rank_ds.annotation["UserID"].tolist()]
+            labs = [int(r) for r in rank_ds.annotation["label"].tolist()]
+            rank_bs = int(cfg.get("rank_batch_size", 64))
+            sampler = UserGroupedSampler(
+                uids, labs, batch_size=rank_bs,
+                items_per_user=int(cfg.get("rank_items_per_user", 8)),
+                seed=int(cfg.get("seed", 0)),
+            )
+            rank_loader = _DL(
+                rank_ds, batch_size=rank_bs, sampler=sampler,
+                num_workers=0, collate_fn=probe_collate,
+            )
+            rank_iter = iter(rank_loader)
+            log_step(
+                "Within-user BPR ACTIVE",
+                f"w_rank={w_rank}, tau={tau_rank}, split={cfg.get('rank_split', 'train_ood2.pkl')}, "
+                f"rows={len(rank_ds)}, batch={rank_bs}, items_per_user="
+                f"{int(cfg.get('rank_items_per_user', 8))}. Watch rank_acc (0.5 = chance) "
+                f"and, more importantly, val_probe_gain — L_rank fits held-in labels so it "
+                f"CAN memorise, exactly like L_ui.",
+            )
+
     def run_uauc_probe(epoch_index):
         if probe_uauc_loader is None:
             return {}
@@ -1133,6 +1181,7 @@ def train_qformer_stage1_representation(cfg):
         model.train()
         accumulator = MetricAccumulator(weights=selection_weights)
         train_steps = 0
+        rank_loss_sum, rank_acc_sum, rank_steps, rank_acc_n = 0.0, 0.0, 0, 0
         for batch in train_loader:
             batch = _move_batch_to_device(batch, device)
             opt.zero_grad()
@@ -1157,6 +1206,35 @@ def train_qformer_stage1_representation(cfg):
                 ui_cond_neg=ui_cond_neg,
                 debug_batch=cfg.debug_batch and epoch == 0 and train_steps < cfg.debug_batch_max_steps,
             )
+            # Within-user BPR replay: ONE batch of real CTR rows per Q-Former
+            # step, added to the same backward. This is the only Stage-1 term
+            # that optimises the metric the project is judged on — see
+            # loss_user_rank. Replayed from its own loader because the qformer
+            # pkl carries POSITIVES only (no negatives to pair against) and the
+            # BPR needs same-user pos/neg rows in one batch.
+            if rank_iter is not None:
+                rank_batch = next(rank_iter, None)
+                if rank_batch is None:               # loader exhausted -> restart
+                    rank_iter = iter(rank_loader)
+                    rank_batch = next(rank_iter, None)
+                if rank_batch is not None:
+                    r_loss, r_acc = model.loss_user_rank(
+                        rank_batch["UserID"].to(device),
+                        rank_batch["TargetItemID"].to(device),
+                        rank_batch["label"].to(device),
+                        rank_batch["InteractedItemIDs_pad"].to(device),
+                        tau=tau_rank,
+                    )
+                    loss = loss + w_rank * r_loss
+                    # Tracked with plain locals: the accumulator only aggregates
+                    # keys in METRIC_GROUPS (it is keyed by sample_type counts),
+                    # so extra entries in `logs` would be silently dropped.
+                    rank_loss_sum += float(r_loss.detach().item())
+                    if r_acc == r_acc:            # not NaN (no pairs this batch)
+                        rank_acc_sum += r_acc
+                        rank_acc_n += 1
+                    rank_steps += 1
+
             loss.backward()
             # Late-run train loss was drifting UP (12.53 -> 12.88 over the
             # last epochs of the 34-epoch run) — clip so single-batch spikes
@@ -1170,6 +1248,12 @@ def train_qformer_stage1_representation(cfg):
             accumulator.update(loss, logs, counts)
             train_steps += 1
 
+        rank_log_str = ""
+        if rank_steps:
+            rank_log_str = (
+                f"L_rank={rank_loss_sum / rank_steps:.4f} "
+                f"rank_acc={(rank_acc_sum / rank_acc_n) if rank_acc_n else float('nan'):.4f}"
+            )
         if (epoch + 1) % cfg.log_epoch == 0:
             avg_train = accumulator.result()
             val_logs = evaluate_loss(
@@ -1235,6 +1319,7 @@ def train_qformer_stage1_representation(cfg):
                 f"L_itc={avg_train['L_itc']:.4f} L_itm={avg_train['L_itm']:.4f} "
                 f"L_itg={avg_train['L_itg']:.4f} L_ii={avg_train['L_ii']:.4f} "
                 f"L_ui={avg_train['L_ui']:.4f} L_uic={avg_train['L_uic']:.4f} "
+                f"{rank_log_str} "
                 f"L_llm={avg_train['L_llm']:.4f} "
                 f"ITC@1={avg_train['itc_top1']:.4f} ITM_acc={avg_train['itm_acc']:.4f} "
                 f"ITG_acc={avg_train['itg_acc']:.4f} ITG_title={avg_train['itg_title_acc']:.4f} "
