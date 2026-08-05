@@ -224,6 +224,10 @@ class HFQFormerAdapter(nn.Module):
             self.out_res_proj = nn.Linear(d_cf, d_model, bias=False)
             nn.init.normal_(self.out_res_proj.weight, std=d_cf ** -0.5)
             self.res_gain = Parameter(torch.tensor(float(d_model) ** 0.5))
+            # Running mean of ||R @ pooled_cf||, used as a single global scale so
+            # per-row relative norms survive (see _apply_output_residual). A
+            # buffer, so it round-trips through state_dict and eval matches train.
+            self.register_buffer("res_norm_ema", torch.zeros(1))
 
         # Optional second cross-attention source: a frozen semantic (LLM-derived)
         # item embedding next to the CF vector. Attention weighs the two sources
@@ -652,7 +656,27 @@ class HFQFormerAdapter(nn.Module):
         if not self.output_residual or pooled_cf is None or not apply:
             return query_hidden
         res = self.out_res_proj(pooled_cf.to(self.out_res_proj.weight.dtype))
-        res = torch.nn.functional.normalize(res, dim=-1) * self.res_gain
+        # Scale by a RUNNING MEAN norm, not per-row L2. Per-row normalisation was
+        # a bug: a random projection preserves INNER PRODUCTS, not merely cosines
+        # — for R with entries N(0, 1/d_cf), (Rx).(Ry) ~ (d_model/d_cf) * x.y — so
+        # an unnormalised residual reproduces e_u . e_t, the full MF score
+        # INCLUDING the item norm. Normalising each row threw that norm away, and
+        # it is worth 0.06 uAUC here: measured cos(e_u, e_t) = 0.583 against
+        # e_u . e_t = 0.6437 on the same rows. That is exactly the ceiling the
+        # channel then oscillated around (0.583) while MF sat at 0.6437.
+        #
+        # A single global scale keeps magnitude under control (the reason
+        # normalisation was there at all — MF embedding norms are ~0.73, so a raw
+        # Linear output would be ~20x too small next to a LayerNorm'd body) while
+        # leaving the RELATIVE norms across rows intact, which is where the
+        # ranking signal lives.
+        with torch.no_grad():
+            batch_norm = res.detach().float().norm(dim=-1).mean().clamp(min=1e-6)
+            if self.res_norm_ema.item() <= 0:
+                self.res_norm_ema.fill_(batch_norm)
+            elif self.training:
+                self.res_norm_ema.mul_(0.99).add_(batch_norm, alpha=0.01)
+        res = res / self.res_norm_ema.to(res.dtype) * self.res_gain
         return query_hidden + res.unsqueeze(1).to(query_hidden.dtype)
 
     def encode_cf(

@@ -19,6 +19,7 @@ from sigllm.datasets.movie.movie_ood_dataset import MovieOODDataset
 from sigllm.pipelines.multimodal.probe_cf_channel import (
     build_probe_loader,
     collate as probe_collate,
+    pooling_usage,
     probe_metrics,
 )
 
@@ -975,6 +976,18 @@ def train_qformer_stage1_representation(cfg):
         out = probe_metrics(
             model.qformer, model.mf, model.item_sem_emb, probe_uauc_loader, device
         )
+        pool = pooling_usage(
+            model.qformer, model.mf, model.item_sem_emb, probe_uauc_loader, device
+        )
+        out.update(pool)
+        if pool:
+            log_step(
+                f"[DIAG ep{epoch_index}] history pooling usage",
+                ", ".join(f"cos(full, last{k.split('_k')[-1]})={v:.4f}" for k, v in sorted(pool.items()))
+                + " | cos ~ 1.0 at last1 means the pooling IGNORES all but the most "
+                "recent item — the Q-Former is then not doing the one job it was "
+                "kept for, and losing to a mask-mean is expected.",
+            )
         sem_part = ""
         if "val_probe_sem_gain" in out:
             sem_part = (
@@ -989,6 +1002,9 @@ def train_qformer_stage1_representation(cfg):
             f"MF_dot={out['val_probe_mf_dot_uauc']:.4f} "
             f"MF_hist_cos={out['val_probe_mf_hist_cos_uauc']:.4f} | "
             f"GAIN={out['val_probe_gain']:+.4f} over MF on {int(out['val_probe_rows'])} rows "
+            f"| COMBINED(MF+qformer)={out['val_probe_uauc_combined']:.4f} "
+            f"w={out['val_probe_combined_best_w']:g} "
+            f"combined_gain={out['val_probe_combined_gain']:+.4f} "
             f"{sem_part}"
             f"| gain <= 0 means Stage 1 has not beaten the MF it was built from, "
             f"whatever g_ii/g_ui say; gain ~ 0 means pass-through, so Stage 3 can at "

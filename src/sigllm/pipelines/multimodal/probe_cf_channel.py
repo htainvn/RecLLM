@@ -262,6 +262,57 @@ def build_probe_loader(dataset_cfg, filename, batch_size=64):
 
 
 @torch.no_grad()
+def pooling_usage(qformer, mf, sem_bank, loader, device, max_batches=8):
+    """Is the Q-Former actually POOLING the history, or reading 1-2 items?
+
+    Its assigned job in the division of labour is aggregating a VARIABLE-LENGTH
+    history — the one thing an MLP cannot do. But it currently loses to a plain
+    mask-mean of the same embeddings (0.55 vs 0.6411 uAUC), and there are two very
+    different reasons that could happen: the pooling is fine but the geometry is
+    lost downstream, or the pooling never happens because attention collapses
+    onto a couple of slots.
+
+    Measured without touching HF internals: re-encode with the history TRUNCATED
+    to its last k items and compare the resulting profile to the full-history one.
+    cos ~ 1.0 at k=1 means everything except the most recent item is being
+    ignored, i.e. there is no pooling to speak of and the 8 query tokens are an
+    expensive way to read one embedding.
+    """
+    sims = {1: [], 5: [], 10: []}
+    for bi, batch in enumerate(loader):
+        if bi >= max_batches:
+            break
+        hist = batch["InteractedItemIDs_pad"].to(device)
+        iid = batch["TargetItemID"].to(device)
+        uid = batch["UserID"].to(device)
+        b = uid.size(0)
+        ins = [EVAL_INSTRUCTION] * b
+        target_cf = mf.item_encoder(iid)
+        cond = target_cf if qformer.user_conditioned else None
+        res_vec = mf.user_encoder(uid)
+
+        def enc(h):
+            return qformer(
+                mf.item_encoder(h), ins, user_cf=cond,
+                source_mask=h != mf.padding_index,
+                sem_vec=sem_bank[h] if sem_bank is not None else None,
+                residual_vec=res_vec,
+            ).float().mean(dim=1)
+
+        full = enc(hist)
+        for k in sims:
+            trunc = torch.zeros_like(hist)
+            if k < hist.size(1):
+                trunc[:, -k:] = hist[:, -k:]
+            else:
+                trunc = hist.clone()
+            sims[k].append(_cosine(full, enc(trunc)).cpu())
+    return {
+        f"val_probe_pool_cos_k{k}": float(torch.cat(v).mean()) for k, v in sims.items() if v
+    }
+
+
+@torch.no_grad()
 def probe_metrics(qformer, mf, sem_bank, loader, device, prefix="val_probe"):
     """The probe as a flat metrics dict, for in-training use.
 
@@ -345,6 +396,34 @@ def probe_metrics(qformer, mf, sem_bank, loader, device, prefix="val_probe"):
         max(out[f"{prefix}_uauc"], out[f"{prefix}_uauc_centered"], out[f"{prefix}_uauc_dot"])
         - out[f"{prefix}_mf_dot_uauc"]
     )
+
+    # COMBINED readout: does the Q-Former channel add anything ON TOP of MF?
+    #
+    # This is the question the two-channel design actually poses, and none of the
+    # numbers above answer it. The probe scores the Q-Former path alone, while at
+    # Stage 3 the MLP tokens <UserID>/<ItemID> carry e_u and e_t to the LLM
+    # UNREDUCED and never touch the Q-Former — so the LLM sees both channels and
+    # can weigh them. MF_dot is exactly the information those MLP tokens carry.
+    #
+    # Standardise each score (the LLM would learn its own scaling; z-scores make
+    # the two comparable without pretending to know it) and sweep the weight on
+    # the Q-Former term. best_w ~ 0 means the Q-Former adds NOTHING the MF score
+    # did not already have — the 8 soft tokens are then dead weight in the prompt
+    # at best. best_w > 0 with a gain over MF means the division of labour works
+    # and the Q-Former's contribution is real, just not visible on its own.
+    def _z(x):
+        x = np.asarray(x, dtype=np.float64)
+        return (x - x.mean()) / (x.std() + 1e-12)
+
+    z_mf, z_qf = _z(mf_dot), _z(qf_raw)
+    best_w, best_u = 0.0, out[f"{prefix}_mf_dot_uauc"]
+    for w in (0.0, 0.1, 0.25, 0.5, 1.0, 2.0):
+        u = uauc(z_mf + w * z_qf)
+        if u > best_u:
+            best_w, best_u = w, u
+    out[f"{prefix}_uauc_combined"] = best_u
+    out[f"{prefix}_combined_best_w"] = best_w
+    out[f"{prefix}_combined_gain"] = best_u - out[f"{prefix}_mf_dot_uauc"]
 
     if enc_sem_off is not None:
         pc0 = enc_sem_off["profile_q"] - enc_sem_off["profile_q"].mean(0, keepdim=True)
