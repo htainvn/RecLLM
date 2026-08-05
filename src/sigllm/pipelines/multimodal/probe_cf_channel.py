@@ -103,6 +103,15 @@ def build_qformer(cfg, device, d_sem):
         max_instruction_length=int(qcfg.get("max_instruction_length", 48)),
         init_from_pretrained_text=False,
         user_conditioned=bool(qcfg.get("user_conditioned", False)),
+        # These change the adapter's MODULES, so omitting them made the
+        # standalone probe silently measure a different model than the one being
+        # trained: output_residual=False turns _apply_output_residual into a
+        # no-op, and the strict=False load would just report the weights as
+        # missing. dropout is inert at eval but kept for symmetry.
+        dropout=float(qcfg.get("qformer_dropout", 0.0)),
+        candidate_fusion=bool(qcfg.get("candidate_fusion", False)),
+        item_residual=bool(qcfg.get("item_residual", False)),
+        output_residual=bool(qcfg.get("output_residual", False)),
         d_user=int(cfg.model_cfg.rec_config.embedding_size),
         d_sem=d_sem,
     ).to(device)
@@ -159,7 +168,11 @@ def encode_split(qformer, mf, sem_bank, loader, device):
         target_q = qformer(target_cf, instructions, sem_vec=target_sem)
         cond = target_cf if qformer.user_conditioned else None
         profile_q = qformer(
-            hist_cf, instructions, user_cf=cond, source_mask=hist_mask, sem_vec=hist_sem
+            hist_cf, instructions, user_cf=cond, source_mask=hist_mask, sem_vec=hist_sem,
+            # e_u, matching QRecLLM: the output residual's fallback readout must
+            # be cos(e_u, e_t), not cos(mask_mean(e_hist), e_t) — the latter is
+            # measured BELOW the MF dot product this probe compares against.
+            residual_vec=mf.user_encoder(uid),
         )
 
         # Mean over the Q queries — the same pooling Stage 1's L_ui scores and
@@ -272,6 +285,22 @@ def probe_metrics(qformer, mf, sem_bank, loader, device, prefix="val_probe"):
     qformer.eval()
     try:
         enc = encode_split(qformer, mf, sem_bank, loader, device)
+        # SEM OFF pass. The semantic source is the ONLY component that can carry
+        # information the MF does not already have, so it is the only thing that
+        # can make the channel beat MF rather than merely re-derive it. Nothing
+        # else measures this on the target task: Stage 1's sem_on/sem_off
+        # diagnostic covers the caption losses, and those are identical by
+        # construction while sem_for_text_losses is False.
+        #   sem_gain ~ 0     -> the semantic bank adds nothing to within-user
+        #                       ranking; the channel is a CF pass-through and
+        #                       cannot beat MF by design, not by tuning.
+        #   sem_gain >> 0    -> semantics does carry ranking signal, so a channel
+        #                       stuck at MF level is losing it somewhere later.
+        enc_sem_off = (
+            encode_split(qformer, mf, None, loader, device)
+            if sem_bank is not None
+            else None
+        )
     finally:
         if was_training:
             qformer.train()
@@ -306,6 +335,19 @@ def probe_metrics(qformer, mf, sem_bank, loader, device, prefix="val_probe"):
         max(out[f"{prefix}_uauc"], out[f"{prefix}_uauc_centered"])
         - out[f"{prefix}_mf_dot_uauc"]
     )
+
+    if enc_sem_off is not None:
+        pc0 = enc_sem_off["profile_q"] - enc_sem_off["profile_q"].mean(0, keepdim=True)
+        tc0 = enc_sem_off["target_q"] - enc_sem_off["target_q"].mean(0, keepdim=True)
+        best_off = max(
+            uauc(_cosine(enc_sem_off["profile_q"], enc_sem_off["target_q"]).numpy()),
+            uauc(_cosine(pc0, tc0).numpy()),
+        )
+        out[f"{prefix}_uauc_sem_off"] = best_off
+        # How much of the channel's ranking ability comes from the semantic bank.
+        out[f"{prefix}_sem_gain"] = (
+            max(out[f"{prefix}_uauc"], out[f"{prefix}_uauc_centered"]) - best_off
+        )
     return out
 
 

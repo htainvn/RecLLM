@@ -664,6 +664,7 @@ class HFQFormerAdapter(nn.Module):
         fusion_target: Optional[torch.Tensor] = None,
         fusion_user: Optional[torch.Tensor] = None,
         slot_target: Optional[torch.Tensor] = None,
+        residual_vec: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Queries-only forward over a CF (collaborative filtering) vector.
 
@@ -694,7 +695,8 @@ class HFQFormerAdapter(nn.Module):
             return_dict=True,
         )
         return self._apply_output_residual(
-            outputs.last_hidden_state, self._pool_source(cf_vec, source_mask)
+            outputs.last_hidden_state,
+            residual_vec if residual_vec is not None else self._pool_source(cf_vec, source_mask),
         )
 
     def encode_text(
@@ -737,6 +739,7 @@ class HFQFormerAdapter(nn.Module):
         fusion_target: Optional[torch.Tensor] = None,
         fusion_user: Optional[torch.Tensor] = None,
         slot_target: Optional[torch.Tensor] = None,
+        residual_vec: Optional[torch.Tensor] = None,
     ):
         """Joint forward returning ``(query_hidden, text_hidden, text_ids, text_mask)``.
 
@@ -795,7 +798,8 @@ class HFQFormerAdapter(nn.Module):
 
         sequence_hidden = outputs.last_hidden_state
         query_hidden = self._apply_output_residual(
-            sequence_hidden[:, :query_count], self._pool_source(cf_vec, source_mask)
+            sequence_hidden[:, :query_count],
+            residual_vec if residual_vec is not None else self._pool_source(cf_vec, source_mask),
         )
         text_hidden = sequence_hidden[:, query_count:]
         return query_hidden, text_hidden, text_ids, text_attention_mask
@@ -810,6 +814,7 @@ class HFQFormerAdapter(nn.Module):
         fusion_target: Optional[torch.Tensor] = None,
         fusion_user: Optional[torch.Tensor] = None,
         slot_target: Optional[torch.Tensor] = None,
+        residual_vec: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """LLM-feeding mode: queries cross-attend to ``cf_vec`` (and the
         optional ``sem_vec`` semantic source) while the text stream consumes
@@ -826,5 +831,6 @@ class HFQFormerAdapter(nn.Module):
             fusion_target=fusion_target,
             fusion_user=fusion_user,
             slot_target=slot_target,
+            residual_vec=residual_vec,
         )
         return self.out_proj(query_hidden)

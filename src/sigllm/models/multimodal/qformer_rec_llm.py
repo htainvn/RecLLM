@@ -1211,11 +1211,22 @@ class QRecLLM(Rec2Base):
                 # slot carries [e_t; e_j*e_t; e_j-e_t] (zero-init, no-op at
                 # warm start), so the Q-Former reads the collaborative match
                 # between the candidate and every history item directly.
+                # residual_vec = e_u, NOT the pooled history. The output
+                # residual is the channel's FALLBACK readout, and with the
+                # history mean it falls back to cos(mask_mean(e_hist), e_t) —
+                # measured at 0.6411 uAUC, which is BELOW the MF dot product it
+                # is compared against (0.6437). So that fallback could never
+                # beat MF by construction. e_u is MF's own optimised user
+                # representation, the exact vector MF_dot uses, so the fallback
+                # becomes cos(e_u, e_t) instead. The Q-Former had never seen
+                # e_u anywhere — the same gap as the prompt-side one that
+                # <UserID> fixed, but on the encoder side.
                 profile_q = self.qformer(
                     hist_cf, ins_list, user_cf=target_cond, source_mask=hist_mask,
                     sem_vec=hist_sem,
                     fusion_target=target_cf if self.candidate_fusion else None,
                     fusion_user=user_cf if self.candidate_fusion else None,
+                    residual_vec=self.rec_encoder.user_encoder(batch_data["UserID"]),
                 )
 
                 profile_llm = self.llm_proj(profile_q)                          # [B,Q,H]

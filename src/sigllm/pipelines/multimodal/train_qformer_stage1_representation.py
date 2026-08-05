@@ -927,6 +927,12 @@ def train_qformer_stage1_representation(cfg):
         out = probe_metrics(
             model.qformer, model.mf, model.item_sem_emb, probe_uauc_loader, device
         )
+        sem_part = ""
+        if "val_probe_sem_gain" in out:
+            sem_part = (
+                f"| sem_off={out['val_probe_uauc_sem_off']:.4f} "
+                f"sem_gain={out['val_probe_sem_gain']:+.4f} "
+            )
         log_step(
             f"[DIAG ep{epoch_index}] uAUC probe (within-user, the real task)",
             f"channel_uauc={out['val_probe_uauc']:.4f} "
@@ -934,8 +940,11 @@ def train_qformer_stage1_representation(cfg):
             f"MF_dot={out['val_probe_mf_dot_uauc']:.4f} "
             f"MF_hist_cos={out['val_probe_mf_hist_cos_uauc']:.4f} | "
             f"GAIN={out['val_probe_gain']:+.4f} over MF on {int(out['val_probe_rows'])} rows "
+            f"{sem_part}"
             f"| gain <= 0 means Stage 1 has not beaten the MF it was built from, "
-            f"whatever g_ii/g_ui say",
+            f"whatever g_ii/g_ui say; gain ~ 0 means pass-through, so Stage 3 can at "
+            f"best re-derive MF. sem_gain ~ 0 means the semantic bank — the only "
+            f"component carrying information MF lacks — is not helping this task.",
         )
         return out
 
