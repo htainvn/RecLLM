@@ -1,0 +1,31 @@
+A user has given high ratings to the following movies. Given the movielist, the user's feature and a target movie's feature and Title. Please use all available information to identify whether the user will like the target movie by answering "Yes" or "No". The MovieList: <ItemTitleList>. The user's feature is <UserID>. The target movie's feature is <ItemID>, <Warm_ID>. Targetmovie: <TargetItemTitle>.
+# SeLLa's step-3 prompt, for arch: sella_gated_rec_llm.
+#
+# Wording and token layout are SeLLa's (codes/step3_train_sella/
+# prepare_finetune_data.py::write_in_file), with SigLLM's placeholder names
+# substituted for SeLLa's:
+#     SeLLa            here
+#     <User_ID>   ->   <UserID>
+#     <Item_ID>   ->   <ItemID>
+#     <Warm_ID>   ->   <Warm_ID>
+#     {his_non}   ->   <ItemTitleList>
+#     {target}    ->   <TargetItemTitle>
+#
+# THREE soft-token positions, one token each — no <UserProfile>, no
+# <TargetItemID>, nothing added. The history Q-Former does NOT get a position of
+# its own: it is a gated addition onto <UserID>, so at gate = 0 this prompt and
+# this model are SeLLa exactly.
+#
+# ONE prompt line on purpose. SeLLa uses a single fixed instruction, and the
+# model samples uniformly from whatever lines are here during training (the first
+# line is always the one used at eval). Adding more lines turns prompt sampling
+# on and breaks that parity — worth doing as an experiment, not by accident.
+#
+# Do NOT reorder or drop <UserID> / <ItemID>: the model asserts both are present
+# in every prompt, and it injects the soft-token embeddings in the order the
+# placeholders appear here (the scatter matches torch.nonzero's position order).
+# <Warm_ID> is required only while model.sella_gated.warm_token is true; with it
+# false the placeholder is stripped from the rendered prompt.
+#
+# The trailing " Answer:" cue is appended by model.prompt_template, not written
+# here, so that Qwen2-Base continues with "Yes" / "No" as a plain completion.

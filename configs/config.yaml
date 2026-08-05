@@ -146,6 +146,97 @@ model:
     # one phantom slot among L (~1/(L+1) mass).
     candidate_fusion: True
 
+  # ===================================================================
+  # SeLLa-gated variant — read ONLY by arch: sella_gated_rec_llm
+  # (src/sigllm/models/multimodal/sella_gated_rec_llm.py, driven by
+  #  pipelines/multimodal/train_sella_gated_step3.py). Every key above that the
+  #  variant does not read is simply ignored, so QRecLLM's settings are
+  #  untouched and both models can live in one config.
+  #
+  # The difference in one line: instead of 2*num_queries NEW soft-token
+  # positions (<UserProfile> + <TargetItemID>), the Q-Former is a GATED ADDITION
+  # onto SeLLa's existing <UserID> token:
+  #     e_user <- id_proj(e_u) + g * qformer(user, target, history)
+  # with g a single scalar, zero-initialised. At g = 0 the model is SeLLa
+  # numerically — the term is a literal + 0 — so the run cannot start worse, and
+  # g after training IS the measured contribution (logged as qformer/gate plus
+  # the scale-free delta_rel = ||g*delta||/||e_user||).
+  # ===================================================================
+  sella_gated:
+    use_qformer: True
+
+    # Trimmed against model.qformer_config above (768 / 4 layers / CAF 2 /
+    # 8 queries / ~76M with the BERT text branch):
+    #   - text branch REMOVED entirely. The instruction list of this task is
+    #     near-constant, so a text stream carries no per-sample signal while
+    #     costing ~72M parameters and a bert-base download.
+    #   - cross_attention_frequency is fixed at 1 (not configurable): with only
+    #     2 layers, every layer INCLUDING the last must be refreshed from
+    #     memory, otherwise trimming depth starves the readout.
+    d_model: 256
+    num_layers: 2
+    num_queries: 2      # 1 works too; both are pooled by mean into ONE vector
+    num_heads: 4        # 256/4 = 64 dims per head, BERT-base's ratio
+    dropout: 0.0
+
+    # Cross-attention memory, 2L+1 slots for a history of length L:
+    #   L   CF slots            proj_cf(e_j)
+    #   L   semantic slots      proj_sem(LayerNorm(s_j))   <- use_sem
+    #   1   user x target slot  fuse_user([e_u; e_u*e_t; e_u-e_t])  <- use_user_slot
+    # The e_u*e_t block is why the interaction slot exists: its coordinate sum IS
+    # the MF dot product, so attention can read the collaborative match between
+    # this user and this candidate. It must be a SLOT, not a delta broadcast over
+    # the other keys — a broadcast shifts every attention logit equally (softmax
+    # unchanged) and adds a slot-independent constant, i.e. it degenerates into a
+    # plain output bias.
+    use_sem: True
+    use_user_slot: True
+
+    # Per-slot candidate fusion: m_j += fuse_hist([e_t; e_j*e_t; e_j-e_t]).
+    # OFF by default because candidate-dependence already enters through the
+    # query residual (each query is shifted by target_proj(e_t), so the same
+    # history pools differently per candidate). This is the first thing to switch
+    # on if the gate grows but uAUC does not.
+    hist_target_fusion: False
+
+    # Semantic-slot source. Left null it falls back to
+    # model.qformer_config.item_llm_emb_path. The preferred source is actually
+    # neither file but the MF's live, TRAINED item_embedding_llm table (present
+    # whenever rec_config.item_llm_emb_path is set) — SeLLa trains that table, so
+    # reading the raw bank instead would discard the Step-2 alignment.
+    item_llm_emb_path: null
+
+    # <Warm_ID> must stay ON for SeLLa parity: SeLLa injects all three tokens.
+    # (model.qformer_config.warm_token above is False for QRecLLM's own runs;
+    # that key is not read here.)
+    warm_token: True
+
+    # SeLLa freezes LoRA at step 3 — step 1 already adapted the LLM to the task,
+    # and this stage trains the collaborative side against it. true makes LoRA
+    # joint, which is a different (and less controlled) experiment.
+    lora_trainable: False
+
+    # Training objective. SeLLa: LM cross-entropy over the WHOLE sequence, with
+    # the Yes/No softmax extracted only at eval.
+    #   full          SeLLa exactly — every non-pad position supervised,
+    #                 including the soft-token positions (SeLLa's target_ids are
+    #                 input_ids with only padding masked).
+    #   full_no_soft  the same, minus the soft-token positions. Worth trying:
+    #                 SeLLa's three slots hold three DISTINCT special ids, but
+    #                 here all three share one reserved id, so `full` spends
+    #                 gradient on "emit the placeholder".
+    #   answer        only the Yes/No token. Cheapest by far (see the batch-size
+    #                 note in run.sella_gated_step3) and closest to the 2-way CE
+    #                 that QRecLLM used.
+    lm_loss_scope: full
+
+    # How often (training steps) to log gate + delta_rel. 0 disables.
+    gate_log_steps: 50
+
+    # Inference-time ablation: zero the gated term without touching the gate, so
+    # a trained checkpoint can be scored with and without the contribution.
+    ablate_qformer: False
+
   rec_config:
     user_num: 839
     item_num: 3256
@@ -842,6 +933,59 @@ run:
     # embedding tables — there decay drags rows that a batch never visits
     # toward zero.
     rec_weight_decay: 1e-4
+
+  sella_gated_step3:
+    # The ONLY training stage of the gated-Q-Former variant (arch:
+    # sella_gated_rec_llm). Stage 1 (InfoNCE) and Stage 2 (generative) are NOT
+    # run: with ~4.3M parameters behind a zero-init gate there is nothing for a
+    # representation-pretraining stage to protect, and both stages were carrying
+    # a documented failure (Stage 1's gain near chance, Stage 2 drowned out by
+    # the <ItemTitleList> text path).
+    #
+    # Prerequisites: distill (last_hidden bank) -> MF with the Step-2 alignment
+    # -> qformer_stage3_step1_lora -> this.
+    prompt_path: "/content/SigLLM/prompts/sella_gated_movie.txt"
+    output_dir: "/content/SigLLM/ckpt/sella_gated_step3_qwen2/"
+    best_ckpt_name: "checkpoint_best.pth"
+
+    # Which LoRA to start from: step1 (SeLLa's arrangement) | step2 | self
+    # (resume this stage) | none (cold LoRA, an explicitly different experiment).
+    ckpt_from: step1
+
+    # MF joins the trainable set, as SeLLa does at its final step, in its own
+    # optimizer param group. rec_lr_scale 3.33 * init_lr 3e-5 ~= 1e-4 for the
+    # embeddings — same setting as qformer_stage3_step2, which is where the
+    # comparable number comes from. Watch the "MF drift" log line: rising drift
+    # with flat val uAUC means lower this. Set true to hold MF fixed and isolate
+    # the Q-Former's contribution alone.
+    freeze_rec: false
+    rec_lr_scale: 3.33
+    rec_weight_decay: 1e-4
+
+    init_lr: 3e-5
+    # Must be set together with init_lr — the top-level min_lr (8e-5) is ABOVE
+    # this, which would invert the cosine schedule into a climb.
+    min_lr: 3e-6
+    max_epoch: 30
+
+    # SMALLER than the top-level 16, and that is about the loss, not the model.
+    # SeLLa's objective is full-vocabulary LM cross-entropy over the whole
+    # sequence, where QRecLLM's touched ONE position. With Qwen2's 151936-token
+    # vocab and a ~350-token prompt, the fp32 logits for the supervised positions
+    # cost roughly 0.2 GB per sample, plus as much again inside cross_entropy —
+    # about 0.5 GB/sample transient, i.e. ~8 GB at batch 16 on top of the 14 GB
+    # fp16 model. 8 keeps that near 4 GB.
+    #
+    # If it still OOMs, in order of preference:
+    #   1. model.sella_gated.lm_loss_scope=answer  (supervises 1 position per
+    #      sample; the memory term all but disappears)
+    #   2. lower this
+    #   3. lower datasets.movie_ood.max_history_length (shortens the prompt)
+    batch_size_train: 8
+    batch_size_eval: 16
+    # Doubled from the top-level 400 so samples-per-epoch stays at 6400 despite
+    # the halved batch — keeps "epoch" comparable to the other stages' logs.
+    iters_per_epoch: 800
 
   # Optimization
   lr_sched: "linear_warmup_cosine_lr"
