@@ -270,36 +270,50 @@ datasets:
     # exactly the sequence length Stage 3 feeds it. Changing this requires
     # rebuilding the qformer pkls.
     #
-    # 50, up from 10. Measured on the raw ml-1m split (real items, padding
-    # excluded): median real history is 24 on train, 38 on valid, 42 on test,
-    # with p90 = 97 / 138 / 192. At a cap of 10, 74% of train rows and 89% of
-    # test rows were truncated, and only 28% / 13% had their full history
-    # visible — <UserProfile> was pooling 10 items for users who have 24-42.
+    # 40, down from 50 (and originally 10). Measured on the raw ml-1m split
+    # (real items, padding excluded): median real history is 24 on train, 38 on
+    # valid, 42 on test, with p90 = 97 / 138 / 192.
     #
     # Coverage (fraction of rows whose FULL history fits) vs cost:
     #     cap  train  valid   test | tok max  slack | ui fwd  act MB
     #      10  28.1%  16.0%  13.1% |      86    938 |   1.0x      32
-    #      40  66.1%  52.3%  48.6% |     280    744 |   4.0x     129
+    #  ->  40  66.1%  52.3%  48.6% |     280    744 |   4.0x     129
     #      50  72.6%  59.5%  57.1% |     332    692 |   5.0x     161
     #      80  85.7%  76.1%  69.5% |     495    529 |   8.0x     258
     #     100  90.7%  82.8%  74.2% |     618    406 |  10.0x     323
     #
-    # Prompt budget is NOT the binding constraint at any of these: <UserProfile>
-    # stays 8 POOLED soft tokens regardless of history length, so only the
-    # <ItemTitleList> text grows, and even cap 100 leaves ~406 of
+    # 50 -> 40 costs ~7-9 points of full-history coverage and buys back ~52
+    # prompt tokens per sample plus a fifth of the history-side compute. On the
+    # SeLLa-gated branch (arch: sella_gated_rec_llm) the token saving is worth
+    # more than it looks: that branch trains with FULL-VOCABULARY LM
+    # cross-entropy over the whole sequence, so its dominant memory term scales
+    # with prompt length x 151936, not with the history tensor. ~280 vs ~332
+    # tokens is roughly a 15% cut in that term.
+    #
+    # Prompt budget is NOT the binding constraint at any of these: on the gated
+    # branch the collaborative signal is 3 soft tokens regardless of history
+    # length (and on nhánh A, <UserProfile> is 8 POOLED tokens regardless), so
+    # only the <ItemTitleList> text grows, and even cap 100 leaves ~406 of
     # max_txt_len=1024 free. The headroom matters because the tokenizer
     # truncates on the RIGHT — an overflow deletes <TargetItemTitle> and the
-    # "Answer:" cue outright rather than degrading gracefully.
+    # "Answer:" cue outright rather than degrading gracefully. On the gated
+    # branch that failure is caught loudly instead of silently: losing a
+    # placeholder makes the soft-token slot count wrong and
+    # _build_prompt_inputs raises.
     #
-    # The binding constraint is TIME: loss_user_item runs three forwards over
-    # the [B, L] history (base + pos-conditioned + neg-conditioned), so the ui
-    # term scales linearly in the cap. Expect Stage 1 to go from ~43s to
-    # ~90-120s per epoch at 50.
-    #
-    # Note when reading the result: at 50, test coverage is still only 57%, so a
-    # FLAT uAUC does not yet prove "longer history does not help" — it would
-    # justify trying 80 (69.5% test) before concluding.
-    max_history_length: 50
+    # REBUILD CAVEAT. This key is read in two places at two different times:
+    #   - MovieOODDataset reads it at LOAD time -> the Stage-3 prompts (both
+    #     branches) pick the new value up immediately, no rebuild needed;
+    #   - build_qformer_dataset reads it at BUILD time and the builder bakes the
+    #     truncation into *_qformer_ood2.pkl, which qformer_alignment_dataset
+    #     then passes through WITHOUT re-truncating.
+    # So the already-built qformer pkls still carry 50-item histories. That is
+    # harmless for the SeLLa-gated branch, which never runs Stage 1/2 and never
+    # reads those pkls. If you go back to nhánh A, rerun
+    # `python src/sigllm/pipelines/multimodal/build_qformer_dataset.py
+    #  --cfg-path configs/config.yaml` first, or Stage 1 pretrains the history
+    # pooling on length 50 while Stage 3 feeds it 40.
+    max_history_length: 40
     build_info:
       storage: "/content/SigLLM/data/processed/ml-1m/"
 
@@ -1002,10 +1016,12 @@ run:
     # SMALLER than the top-level 16, and that is about the loss, not the model.
     # SeLLa's objective is full-vocabulary LM cross-entropy over the whole
     # sequence, where QRecLLM's touched ONE position. With Qwen2's 151936-token
-    # vocab and a ~350-token prompt, the fp32 logits for the supervised positions
-    # cost roughly 0.2 GB per sample, plus as much again inside cross_entropy —
-    # about 0.5 GB/sample transient, i.e. ~8 GB at batch 16 on top of the 14 GB
-    # fp16 model. 8 keeps that near 4 GB.
+    # vocab, the fp32 logits for the supervised positions cost ~0.6 MB per
+    # PROMPT TOKEN per sample, plus as much again inside cross_entropy. At
+    # datasets.movie_ood.max_history_length=40 the prompt runs ~280-300 tokens,
+    # so ~0.35-0.4 GB/sample transient — ~6 GB at batch 16 on top of the 14 GB
+    # fp16 model. 8 keeps it near 3 GB. Raising the history cap raises this
+    # LINEARLY, so change the two together.
     #
     # If it still OOMs, in order of preference:
     #   1. model.sella_gated.lm_loss_scope=answer  (supervises 1 position per
