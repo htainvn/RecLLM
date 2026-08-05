@@ -63,6 +63,7 @@ class HFQFormerAdapter(nn.Module):
         d_sem: Optional[int] = None,
         candidate_fusion: bool = False,
         item_residual: bool = False,
+        output_residual: bool = False,
     ):
         super().__init__()
 
@@ -183,6 +184,46 @@ class HFQFormerAdapter(nn.Module):
             self.item_res_proj = nn.Linear(d_cf, num_queries * d_model)
             nn.init.zeros_(self.item_res_proj.weight)
             nn.init.zeros_(self.item_res_proj.bias)
+
+        # OUTPUT residual: add a projection of the pooled CF source to the query
+        # output, skipping the transformer body entirely.
+        #
+        # Motivated by a direct measurement on the target task (the in-training
+        # uAUC probe), not by theory. On valid_ood2, within-user uAUC:
+        #     cosine(mask_mean(e_hist), e_i)   0.6411   <- NO learned parameters
+        #     MF dot product                   0.6437
+        #     Q-Former pooled cosine (raw)     0.4725   <- BELOW chance, declining
+        #     Q-Former pooled cosine centered  0.5411
+        # i.e. the trained body LOSES ranking information that a mask-mean keeps,
+        # and centering (which removes the shared direction) recovers only part
+        # of it. So the fix is not more training but making that readout part of
+        # the hypothesis class: with this residual the model can always fall back
+        # to it, and can only improve on it.
+        #
+        # INIT IS THE WHOLE POINT and differs from every other new path here.
+        # item_residual / fuse_cf / user_proj are zero-init because they are
+        # OPTIONAL refinements that should start as no-ops. This one is a
+        # FALLBACK we want active from step 0 — zero-init would start the channel
+        # at the broken 0.47 and hope training discovers the readout. So:
+        #   - out_res_proj is a RANDOM projection (std 1/sqrt(d_cf)). Random
+        #     projections approximately preserve cosines (Johnson-Lindenstrauss),
+        #     so cos(R m_hist, R e_t) ~ cos(m_hist, e_t) — the 0.641 readout
+        #     arrives essentially intact rather than having to be learned.
+        #   - the residual is L2-NORMALISED then scaled by a learnable
+        #     ``res_gain`` initialised to sqrt(d_model), matching the per-token
+        #     norm a LayerNorm'd body output has (~sqrt(768) = 27.7). Normalising
+        #     first makes this independent of the MF embedding scale (~0.73 here),
+        #     which a raw Linear would have made the residual ~20x too small to
+        #     matter. res_gain is learnable so the body can take over later.
+        #
+        # NOTE this breaks strict-loading of pre-existing Q-Former checkpoints
+        # (new keys, and a non-zero init means it is NOT a no-op). Stage 1 has to
+        # be retrained — already required here anyway by num_layers 4->3.
+        self.output_residual = bool(output_residual)
+        if self.output_residual:
+            self.out_res_proj = nn.Linear(d_cf, d_model, bias=False)
+            nn.init.normal_(self.out_res_proj.weight, std=d_cf ** -0.5)
+            self.res_gain = Parameter(torch.tensor(float(d_model) ** 0.5))
 
         # Optional second cross-attention source: a frozen semantic (LLM-derived)
         # item embedding next to the CF vector. Attention weighs the two sources
@@ -592,6 +633,28 @@ class HFQFormerAdapter(nn.Module):
         mask[:, query_count:, :] = mask[:, query_count:, :] * row_pad
         return mask
 
+    def _apply_output_residual(self, query_hidden, pooled_cf):
+        """query_hidden + res_gain * normalize(R @ pooled_cf), broadcast over Q.
+
+        Applied to the raw query hidden states, BEFORE ``out_proj``. In the
+        default config ``out_proj`` is Identity (qformer_d_model == 
+        qformer_output_dim == 768) so placement is moot there; before is the
+        choice that keeps every consumer consistent, since ``encode_cf`` returns
+        pre-out_proj states that the pair losses score directly while other
+        callers apply out_proj themselves.
+
+        Broadcast (one vector for all Q positions) rather than per-query: the
+        losses and the probe mean-pool over Q, where the two are equivalent, and
+        in Stage 3 the shared-across-queries part is exactly what
+        SharedDirectionCenter is there to handle. What matters is that it varies
+        per ITEM, which it does.
+        """
+        if not self.output_residual or pooled_cf is None:
+            return query_hidden
+        res = self.out_res_proj(pooled_cf.to(self.out_res_proj.weight.dtype))
+        res = torch.nn.functional.normalize(res, dim=-1) * self.res_gain
+        return query_hidden + res.unsqueeze(1).to(query_hidden.dtype)
+
     def encode_cf(
         self,
         cf_vec: torch.Tensor,
@@ -630,7 +693,9 @@ class HFQFormerAdapter(nn.Module):
             encoder_attention_mask=encoder_attention_mask,
             return_dict=True,
         )
-        return outputs.last_hidden_state
+        return self._apply_output_residual(
+            outputs.last_hidden_state, self._pool_source(cf_vec, source_mask)
+        )
 
     def encode_text(
         self,
@@ -729,7 +794,9 @@ class HFQFormerAdapter(nn.Module):
         )
 
         sequence_hidden = outputs.last_hidden_state
-        query_hidden = sequence_hidden[:, :query_count]
+        query_hidden = self._apply_output_residual(
+            sequence_hidden[:, :query_count], self._pool_source(cf_vec, source_mask)
+        )
         text_hidden = sequence_hidden[:, query_count:]
         return query_hidden, text_hidden, text_ids, text_attention_mask
 

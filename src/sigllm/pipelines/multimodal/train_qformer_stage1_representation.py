@@ -99,6 +99,7 @@ def _init_qformer(cfg, d_model, device, d_sem=None):
         dropout=float(cfg.get("qformer_dropout", 0.0)),
         candidate_fusion=bool(cfg.get("candidate_fusion", False)),
         item_residual=bool(cfg.get("item_residual", False)),
+        output_residual=bool(cfg.get("output_residual", False)),
         d_user=int(cfg.embedding_size),
         d_sem=d_sem,
     ).to(device)
@@ -181,6 +182,13 @@ def _zero_init_path_norms(model):
         bias = getattr(module, "bias", None)
         if bias is not None:
             out[f"{name}_bias"] = float(bias.detach().norm().item())
+    # res_gain is the ONE non-zero-init path (see output_residual): it starts at
+    # sqrt(d_model) so the mask-mean readout is active from step 0. Its TREND is
+    # the interesting part — falling means the body is learning to carry the
+    # ranking itself, rising means it is leaning harder on the readout.
+    res_gain = getattr(qformer, "res_gain", None)
+    if res_gain is not None:
+        out["res_gain"] = float(res_gain.detach().item())
     return out
 
 

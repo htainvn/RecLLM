@@ -189,6 +189,31 @@ model:
     # Does NOT change the state_dict, so existing checkpoints stay loadable.
     qformer_dropout: 0.1
 
+    # OUTPUT residual: add normalize(R @ pooled_cf) * res_gain to the query
+    # output, skipping the transformer body. Motivated by the in-training uAUC
+    # probe measuring the target task directly on valid_ood2:
+    #     cosine(mask_mean(e_hist), e_i)  0.6411   <- NO learned parameters
+    #     MF dot product                  0.6437
+    #     Q-Former pooled cosine (raw)    0.4725   <- below chance, DECLINING
+    #     Q-Former pooled cosine centered 0.5411
+    # The trained body LOSES ranking information a mask-mean keeps, so the fix
+    # is to put that readout INSIDE the hypothesis class: with the residual the
+    # model can always fall back to it and can only improve on it.
+    #
+    # UNLIKE item_residual / candidate_fusion, this is NOT zero-init — that is
+    # the point. A zero init would start the channel at the broken 0.47 and hope
+    # training finds the readout. Instead R is a random projection (cosines are
+    # approximately preserved, Johnson-Lindenstrauss) and res_gain starts at
+    # sqrt(d_model), matching a LayerNorm'd body output's per-token norm.
+    # Simulated with a body whose ranking was scrambled to chance (0.4963), the
+    # residual restored the readout, and was insensitive to gain over 0.25x-4x —
+    # so the init does not need tuning. res_gain is learnable, so the body can
+    # take over later; watch it in the zero-init paths diagnostic.
+    #
+    # Breaks strict-loading of older Q-Former checkpoints (new keys, non-zero
+    # init). Stage 1 must be retrained — already required by num_layers 4->3.
+    output_residual: True
+
     # Remove the direction shared across items from the soft tokens, before the
     # LayerNorm that scales them for injection (llm_proj becomes
     # Linear -> SharedDirectionCenter -> LayerNorm; a running mean tracked per
@@ -721,6 +746,7 @@ run:
     # and these add/remove modules (fuse_cf, fuse_user, item_res_proj).
     candidate_fusion: ${model.qformer_config.candidate_fusion}
     item_residual: ${model.qformer_config.item_residual}
+    output_residual: ${model.qformer_config.output_residual}
     qformer_dropout: ${model.qformer_config.qformer_dropout}
     # Semantic second cross-attention source (reuses item_llm_emb_path below).
     sem_source: ${model.qformer_config.sem_source}
@@ -838,6 +864,7 @@ run:
     # and these add/remove modules (fuse_cf, fuse_user, item_res_proj).
     candidate_fusion: ${model.qformer_config.candidate_fusion}
     item_residual: ${model.qformer_config.item_residual}
+    output_residual: ${model.qformer_config.output_residual}
     qformer_dropout: ${model.qformer_config.qformer_dropout}
     # Must match Stage 1 and Stage 3 — llm_proj is warm-started from Stage 1's
     # llm_align_proj here and exported to Stage 3 under a strict load.

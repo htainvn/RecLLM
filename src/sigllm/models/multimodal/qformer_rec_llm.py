@@ -123,6 +123,7 @@ class QRecLLM(Rec2Base):
         direct_id_tokens=False,
         candidate_fusion=False,
         item_residual=False,
+        output_residual=False,
         qformer_dropout=0.0,
         center_soft_tokens=True,
         pretrained_item_llm_emb=None,
@@ -169,6 +170,7 @@ class QRecLLM(Rec2Base):
         self.direct_id_tokens = bool(direct_id_tokens)
         self.candidate_fusion = bool(candidate_fusion)
         self.item_residual = bool(item_residual)
+        self.output_residual = bool(output_residual)
         self.center_soft_tokens = bool(center_soft_tokens)
         self.embed_placeholders = list(self.PLACEHOLDERS_FOR_EMBED)
         if self.warm_token and "<Warm_ID>" not in self.embed_placeholders:
@@ -250,6 +252,7 @@ class QRecLLM(Rec2Base):
             d_sem=self.item_sem_emb.size(-1) if self.item_sem_emb is not None else None,
             candidate_fusion=self.candidate_fusion,
             item_residual=self.item_residual,
+            output_residual=self.output_residual,
             qformer_dropout=qformer_dropout,
         )
         self._init_projection(proj_token_num, freeze_proj, pretrained_llm_proj)
@@ -593,6 +596,7 @@ class QRecLLM(Rec2Base):
         d_sem: int = None,
         candidate_fusion: bool = False,
         item_residual: bool = False,
+        output_residual: bool = False,
         qformer_dropout: float = 0.0,
     ):
         log_step("Loading QFormer")
@@ -617,6 +621,7 @@ class QRecLLM(Rec2Base):
             dropout=qformer_dropout,
             candidate_fusion=candidate_fusion,
             item_residual=item_residual,
+            output_residual=output_residual,
         ).to(self.device)
 
         if pretrained_qformer and pretrained_qformer != "not_have":
@@ -1777,6 +1782,7 @@ class QRecLLM(Rec2Base):
         candidate_fusion = bool(qformer_config.get("candidate_fusion", False))
         item_residual = bool(qformer_config.get("item_residual", False))
         qformer_dropout = float(qformer_config.get("qformer_dropout", 0.0))
+        output_residual = bool(qformer_config.get("output_residual", False))
         center_soft_tokens = bool(qformer_config.get("center_soft_tokens", True))
         pretrained_item_llm_emb = qformer_config.get("item_llm_emb_path", None)
         sem_source = bool(qformer_config.get("sem_source", False))
@@ -1832,6 +1838,7 @@ class QRecLLM(Rec2Base):
             direct_id_tokens=direct_id_tokens,
             candidate_fusion=candidate_fusion,
             item_residual=item_residual,
+            output_residual=output_residual,
             qformer_dropout=qformer_dropout,
             center_soft_tokens=center_soft_tokens,
             pretrained_item_llm_emb=pretrained_item_llm_emb,
