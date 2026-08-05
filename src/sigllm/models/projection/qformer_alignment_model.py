@@ -153,6 +153,8 @@ class QRecInstructAlignmentModel(nn.Module):
         bpr_logit_center=True,
         sem_for_text_losses=False,
         center_soft_tokens=True,
+        cf_dropout=0.0,
+        rank_residual=True,
     ) -> None:
         super().__init__()
         self.mf = mf
@@ -186,6 +188,15 @@ class QRecInstructAlignmentModel(nn.Module):
         # trained so warm items don't lose CF grounding to the easier semantic
         # shortcut.
         self.sem_dropout = float(sem_dropout)
+        # See _cf_keep: hides the CF source so the SEMANTIC path is forced to
+        # learn a ranking, the regime no training row provides on its own.
+        self.cf_dropout = float(cf_dropout)
+        # Rank on MF + channel instead of channel alone (see loss_user_rank).
+        self.rank_residual = bool(rank_residual)
+        # Learnable weight on the channel's contribution to the sum. Starts at
+        # 1.0 so the channel is heard from step 0; the loss can shrink it if the
+        # channel is genuinely unhelpful, which is itself a readable signal.
+        self.rank_residual_gain = nn.Parameter(torch.tensor(1.0))
         # Runtime kill switch for the semantic source, independent of
         # ``self.training``. The dropout gate is train-only, so evaluation
         # always ran with the semantic source at FULL strength — and since that
@@ -260,6 +271,29 @@ class QRecInstructAlignmentModel(nn.Module):
             yield
         finally:
             self.sem_enabled = previous
+
+    def _cf_keep(self, n, device):
+        """Bernoulli keep-mask simulating COLD items during training.
+
+        ``cf_dropout`` is the mirror of ``sem_dropout``: that one hides semantics
+        so the CF path stays trained, this one hides CF so the SEMANTIC path gets
+        trained at all. Without it proj_sem only ever sees rows where CF already
+        works — every training row is warm by construction
+        (data_preprocessing sets train_["not_cold"] = 1) — so nothing ever asks
+        semantics to carry a ranking on its own, which is why sem_gain measured ~0
+        and why the cold probe showed no gain over MF.
+
+        Train-only, and a no-op without a semantic bank: dropping CF with nothing
+        to fall back on would leave the row with no memory at all.
+        """
+        if (
+            not self.training
+            or self.cf_dropout <= 0.0
+            or self.item_sem_emb is None
+            or not self.sem_enabled
+        ):
+            return None
+        return (torch.rand(n, device=device) >= self.cf_dropout).float()
 
     def _sem_for(self, item_ids: torch.Tensor):
         """Semantic source rows for ``item_ids`` with training-time row dropout.
@@ -696,7 +730,10 @@ class QRecInstructAlignmentModel(nn.Module):
         user_q = self.qformer.encode_cf(
             user_src, source_mask=user_mask, sem_vec=user_sem,
         )
-        item_q = self.qformer.encode_cf(item_cf, sem_vec=item_sem)
+        item_q = self.qformer.encode_cf(
+            item_cf, sem_vec=item_sem,
+            cf_keep=self._cf_keep(item_cf.size(0), item_cf.device),
+        )
 
         # Every candidate is scored the same way — no query index is picked
         # against the positive first (the old bias) and no Q x Q max to collapse
@@ -853,7 +890,10 @@ class QRecInstructAlignmentModel(nn.Module):
             source_mask=user_mask,
             sem_vec=user_sem,
         )
-        target_q = self.qformer.encode_cf(item_cf, sem_vec=self._sem_for(item_ids))
+        target_q = self.qformer.encode_cf(
+            item_cf, sem_vec=self._sem_for(item_ids),
+            cf_keep=self._cf_keep(item_cf.size(0), item_cf.device),
+        )
 
         # COSINE, not the dot product. Scoring the dot was a real bug: within one
         # user profile_q is near-fixed, so dot-ranking == ranking by
@@ -869,6 +909,41 @@ class QRecInstructAlignmentModel(nn.Module):
         u_vec = F.normalize(profile_q.mean(dim=1), dim=-1)
         i_vec = F.normalize(target_q.mean(dim=1), dim=-1)
         scores = (u_vec * i_vec).sum(dim=-1)
+
+        if self.rank_residual:
+            # RESIDUAL BOOSTING. Rank on MF_dot + channel, not on the channel
+            # alone.
+            #
+            # Every previous objective made <UserProfile> compete with e_u on the
+            # SAME question, which it cannot win: e_u is 256 free parameters per
+            # user fit directly on the CTR objective over that user's entire
+            # training history, while the profile is a shared function trained on
+            # pretexts. And the one attempt to help it — distilling MF's ordering
+            # (ui_cond_distill_mf) — taught the profile to BECOME e_u, which is
+            # why it collapsed the body onto the MF-margin axis. Redundancy, not
+            # complementarity.
+            #
+            # Adding MF into the score removes the incentive to re-derive it: a
+            # pair MF already orders correctly contributes almost no gradient, so
+            # capacity flows to the pairs MF gets WRONG. On cold rows, where MF is
+            # near chance (measured MF_dot 0.5591), that is automatically most of
+            # them.
+            #
+            # It also makes the objective identical to the metric being reported:
+            # combined_gain is exactly "does MF + channel beat MF", and until now
+            # that was measured while something else was trained.
+            #
+            # MF is detached (it is frozen in Stage 1 anyway). Both terms are
+            # divided by their batch std so tau means the same thing for the sum;
+            # the means are not subtracted because BPR sees only differences, where
+            # any constant cancels.
+            mf_score = (
+                self.mf.user_encoder(user_ids) * item_cf
+            ).sum(dim=-1).detach().float()
+            mf_scale = mf_score.std().detach().clamp(min=1e-6)
+            ch_scale = scores.std().detach().clamp(min=1e-6)
+            scores = mf_score / mf_scale + self.rank_residual_gain * (scores / ch_scale)
+
         loss = _per_user_pairwise_loss(scores, user_ids, labels, tau)
         with torch.no_grad():
             acc = _per_user_pairwise_acc(scores, user_ids, labels)

@@ -21,6 +21,7 @@ from sigllm.pipelines.multimodal.probe_cf_channel import (
     collate as probe_collate,
     pooling_usage,
     probe_metrics,
+    sem_coverage,
 )
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -196,6 +197,12 @@ def _zero_init_path_norms(model):
     res_gain = getattr(qformer, "res_gain", None)
     if res_gain is not None:
         out["res_gain"] = float(res_gain.detach().item())
+    # Weight the residual BPR puts on the channel next to MF. This is the most
+    # direct read available of "is the channel contributing": the loss shrinks
+    # it toward 0 when adding the channel to MF does not help.
+    rrg = getattr(model, "rank_residual_gain", None)
+    if rrg is not None:
+        out["rank_residual_gain"] = float(rrg.detach().item())
     return out
 
 
@@ -803,6 +810,14 @@ def train_qformer_stage1_representation(cfg):
         # warm-starts llm_proj from this llm_align_proj under a strict load, so
         # a mismatch here silently changes the layout the export has to fit.
         center_soft_tokens=bool(cfg.get("center_soft_tokens", True)),
+        # Simulated cold start: hides the CF source so the semantic path is
+        # forced to learn a ranking. Every training row is warm by
+        # construction, so without this proj_sem never trains in the regime
+        # that decides cold performance (measured: sem_gain ~ 0).
+        cf_dropout=float(cfg.get("cf_dropout", 0.0)),
+        # Rank on MF + channel rather than channel alone, so the channel is
+        # rewarded only for what MF gets WRONG (see loss_user_rank).
+        rank_residual=bool(cfg.get("rank_residual", True)),
     ).to(device)
 
     # DIN-style pretraining of the candidate-conditioning path: only possible
@@ -1003,6 +1018,23 @@ def train_qformer_stage1_representation(cfg):
             model.qformer, model.mf, model.item_sem_emb, probe_uauc_loader, device
         )
         if probe_cold_loader is not None:
+            # Gating check, logged ONCE: is the semantic bank even present for the
+            # cold rows? If not, the channel has no signal there by construction
+            # and no number of epochs will change it.
+            if not getattr(run_uauc_probe, "_logged_cov", False):
+                cov = sem_coverage(probe_cold_loader, model.item_sem_emb, model.mf, device)
+                if cov:
+                    log_step(
+                        "COLD semantic coverage",
+                        f"{int(cov['sem_covered'])}/{int(cov['sem_total'])} "
+                        f"({100 * cov['sem_covered_frac']:.1f}%) cold target items have a "
+                        f"NON-ZERO semantic row; mean ||e_i|| of those items="
+                        f"{cov['cf_norm_mean']:.4f} | coverage near 0% means semantics is "
+                        f"absent for exactly the rows that need it, so cold can NEVER work "
+                        f"— rebuild the bank over the full catalog before training further. "
+                        f"A tiny ||e_i|| confirms those CF rows were never updated by SGD.",
+                    )
+                run_uauc_probe._logged_cov = True
             cold = probe_metrics(
                 model.qformer, model.mf, model.item_sem_emb,
                 probe_cold_loader, device, prefix="cold_probe",
@@ -1014,6 +1046,7 @@ def train_qformer_stage1_representation(cfg):
                 f"MF_dot={cold['cold_probe_mf_dot_uauc']:.4f} | "
                 f"GAIN={cold['cold_probe_gain']:+.4f} "
                 f"COMBINED_w={cold['cold_probe_combined_best_w']:g} "
+                f"via={cold['cold_probe_combined_readout']} "
                 f"combined_gain={cold['cold_probe_combined_gain']:+.4f} "
                 f"on {int(cold['cold_probe_rows'])} rows | MF's e_u is a free per-user "
                 f"parameter, so it cannot be out-represented on WARM users; cold is the "
@@ -1059,6 +1092,7 @@ def train_qformer_stage1_representation(cfg):
             f"GAIN={out['val_probe_gain']:+.4f} over MF on {int(out['val_probe_rows'])} rows "
             f"| COMBINED(MF+qformer)={out['val_probe_uauc_combined']:.4f} "
             f"w={out['val_probe_combined_best_w']:g} "
+            f"via={out['val_probe_combined_readout']} "
             f"combined_gain={out['val_probe_combined_gain']:+.4f} "
             f"{sem_part}"
             f"| gain <= 0 means Stage 1 has not beaten the MF it was built from, "
@@ -1181,6 +1215,32 @@ def train_qformer_stage1_representation(cfg):
         for name in (selection_metric, str(cfg.get("collapse_metric", selection_metric)))
         if any(tag in name for tag in DIAG_DERIVED_TAGS)
     ]
+    # Probe-derived keys (val_probe_*, cold_probe_*) exist only on epochs where
+    # the probe ran, and cold_probe_* only when the cold loader was built. Same
+    # class of mid-run KeyError as the diagnostic keys above, so fail at setup.
+    probe_dependent = [
+        name
+        for name in (selection_metric, str(cfg.get("collapse_metric", selection_metric)))
+        if name.startswith(("val_probe", "cold_probe"))
+    ]
+    if probe_dependent:
+        if probe_every <= 0:
+            raise ValueError(
+                f"{probe_dependent} come from the uAUC probe, but "
+                f"probe_every_epochs={probe_every}. Set it to 1."
+            )
+        if probe_every != 1:
+            raise ValueError(
+                f"{probe_dependent} are only published every {probe_every} epochs, so "
+                f"the stopper would KeyError on the epochs in between. Set "
+                f"probe_every_epochs: 1."
+            )
+        if any(n.startswith("cold_probe") for n in probe_dependent) and probe_cold_loader is None:
+            raise ValueError(
+                f"{probe_dependent} need the COLD probe, but no cold loader was built "
+                f"(probe_cold false, or the split has no cold rows)."
+            )
+
     if diag_dependent:
         if not item_text_loaders:
             raise ValueError(

@@ -259,6 +259,40 @@ def build_probe_loader(dataset_cfg, filename, batch_size=64, subset="all"):
 
 
 @torch.no_grad()
+def sem_coverage(loader, sem_bank, mf, device):
+    """Do the target items of this split HAVE a semantic row at all?
+
+    Gating fact for the whole cold-start hypothesis. On a cold row MF's e_i is
+    still at its random init, so the ONLY thing that can rank it is the semantic
+    bank — but an uncovered item has an all-zero row, and _project_sources masks
+    zero rows out. A channel with no CF signal and a masked-out semantic slot has
+    literally nothing, and no amount of training or cf_dropout changes that.
+    Distinguishing "semantics has not learned yet" from "semantics is absent for
+    exactly the rows that need it" decides whether waiting is worth anything.
+
+    Also reports how far the CF embeddings of those items are from the init
+    scale: near-zero movement confirms they were never updated by SGD.
+    """
+    if sem_bank is None:
+        return {}
+    covered, total, cf_norms = 0, 0, []
+    for batch in loader:
+        iid = batch["TargetItemID"].to(device)
+        rows = sem_bank[iid]
+        covered += int((rows.norm(dim=-1) > 0).sum())
+        total += int(iid.numel())
+        cf_norms.append(mf.item_encoder(iid).float().norm(dim=-1).cpu())
+    if not total:
+        return {}
+    return {
+        "sem_covered_frac": covered / total,
+        "sem_covered": float(covered),
+        "sem_total": float(total),
+        "cf_norm_mean": float(torch.cat(cf_norms).mean()),
+    }
+
+
+@torch.no_grad()
 def pooling_usage(qformer, mf, sem_bank, loader, device, max_batches=8):
     """Is the Q-Former actually POOLING the history, or reading 1-2 items?
 
@@ -439,7 +473,14 @@ def probe_metrics(qformer, mf, sem_bank, loader, device, prefix="val_probe"):
         x = np.asarray(x, dtype=np.float64)
         return (x - x.mean()) / (x.std() + 1e-12)
 
-    z_mf, z_qf = _z(mf_dot), _z(qf_raw)
+    # Combine MF with the Q-Former's BEST readout, not an arbitrary one. Using
+    # qf_raw (the cosine) here was a bug: after the residual carried the item norm
+    # again, the DOT readout became much the stronger of the two (measured 0.6274
+    # vs 0.5869), so the test was handicapping the channel it is meant to judge.
+    qf_candidates = {"raw": qf_raw, "centered": qf_cen, "dot": qf_dot}
+    qf_name = max(qf_candidates, key=lambda k: uauc(qf_candidates[k]))
+    z_mf, z_qf = _z(mf_dot), _z(qf_candidates[qf_name])
+    out[f"{prefix}_combined_readout"] = qf_name
     best_w, best_u = 0.0, out[f"{prefix}_mf_dot_uauc"]
     for w in (0.0, 0.1, 0.25, 0.5, 1.0, 2.0):
         u = uauc(z_mf + w * z_qf)

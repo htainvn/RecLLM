@@ -497,6 +497,7 @@ class HFQFormerAdapter(nn.Module):
         cf_vec: torch.Tensor,
         sem_vec: Optional[torch.Tensor] = None,
         source_mask: Optional[torch.Tensor] = None,
+        cf_keep: Optional[torch.Tensor] = None,
         fusion_target: Optional[torch.Tensor] = None,
         fusion_user: Optional[torch.Tensor] = None,
         slot_target: Optional[torch.Tensor] = None,
@@ -523,6 +524,22 @@ class HFQFormerAdapter(nn.Module):
             cf_vec, source_mask, fusion_target=fusion_target
         )
         cf_slot_count = encoder_hidden_states.size(1)
+        # SIMULATED COLD START. cf_keep=0 masks a row's CF slots out while leaving
+        # its semantic slots attendable, so the model has to rank from semantics
+        # alone. Needed because EVERY training row is warm by construction
+        # (data_preprocessing sets train_["not_cold"] = 1), so proj_sem is only
+        # ever trained where CF already works — precisely where semantics is
+        # redundant — and never in the regime that decides cold performance. That
+        # is the mechanism behind sem_gain ~ 0 and behind the cold probe showing
+        # combined_gain 0: on a cold item e_i is still at its random init, the
+        # Q-Former inherits that, and the one signal that could rescue it was
+        # never asked to.
+        cf_dropped = None
+        if cf_keep is not None:
+            cf_dropped = (cf_keep.view(-1) < 0.5)
+            if bool(cf_dropped.any()):
+                keep_mask = (~cf_dropped).long().view(-1, 1).expand_as(encoder_attention_mask)
+                encoder_attention_mask = encoder_attention_mask * keep_mask
         if sem_vec is not None:
             if self.proj_sem is None:
                 raise ValueError("sem_vec passed but the adapter was built without d_sem")
@@ -541,7 +558,18 @@ class HFQFormerAdapter(nn.Module):
                     f"source sequence {(encoder_hidden_states.size(0), cf_slot_count)}"
                 )
 
-            sem_mask = (sem_seq.norm(dim=-1) > 0).long() * encoder_attention_mask
+            # Padding validity, NOT encoder_attention_mask: the latter may already
+            # carry the simulated-cold CF mask, and ANDing it here would drop the
+            # semantic slots too — leaving the row with no attendable memory at
+            # all and defeating the whole point.
+            pad_valid = (
+                source_mask.long()
+                if source_mask is not None
+                else torch.ones(
+                    sem_seq.size(0), sem_seq.size(1), dtype=torch.long, device=sem_seq.device
+                )
+            )
+            sem_mask = (sem_seq.norm(dim=-1) > 0).long() * pad_valid
             sem_hidden = self.proj_sem(sem_seq.to(self.proj_sem.weight.dtype))
             encoder_hidden_states = torch.cat(
                 [encoder_hidden_states, sem_hidden.to(encoder_hidden_states.dtype)], dim=1
@@ -735,6 +763,7 @@ class HFQFormerAdapter(nn.Module):
         slot_target: Optional[torch.Tensor] = None,
         residual_vec: Optional[torch.Tensor] = None,
         apply_residual: bool = True,
+        cf_keep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Queries-only forward over a CF (collaborative filtering) vector.
 
@@ -753,7 +782,7 @@ class HFQFormerAdapter(nn.Module):
         )
         encoder_hidden_states, encoder_attention_mask = self._project_sources(
             cf_vec, sem_vec, source_mask, fusion_target=fusion_target, fusion_user=fusion_user,
-            slot_target=slot_target
+            slot_target=slot_target, cf_keep=cf_keep
         )
 
         outputs = self.qformer(
@@ -812,6 +841,7 @@ class HFQFormerAdapter(nn.Module):
         slot_target: Optional[torch.Tensor] = None,
         residual_vec: Optional[torch.Tensor] = None,
         apply_residual: bool = True,
+        cf_keep: Optional[torch.Tensor] = None,
     ):
         """Joint forward returning ``(query_hidden, text_hidden, text_ids, text_mask)``.
 
@@ -846,7 +876,7 @@ class HFQFormerAdapter(nn.Module):
         # leaked history length into the pooled profile token.
         encoder_hidden_states, encoder_attention_mask = self._project_sources(
             cf_vec, sem_vec, source_mask, fusion_target=fusion_target, fusion_user=fusion_user,
-            slot_target=slot_target
+            slot_target=slot_target, cf_keep=cf_keep
         )
         query_attention_mask = torch.ones(
             batch_size, query_count, dtype=torch.long, device=cf_vec.device
@@ -889,6 +919,7 @@ class HFQFormerAdapter(nn.Module):
         slot_target: Optional[torch.Tensor] = None,
         residual_vec: Optional[torch.Tensor] = None,
         apply_residual: bool = True,
+        cf_keep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """LLM-feeding mode: queries cross-attend to ``cf_vec`` (and the
         optional ``sem_vec`` semantic source) while the text stream consumes
@@ -907,5 +938,6 @@ class HFQFormerAdapter(nn.Module):
             slot_target=slot_target,
             residual_vec=residual_vec,
             apply_residual=apply_residual,
+            cf_keep=cf_keep,
         )
         return self.out_proj(query_hidden)

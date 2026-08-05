@@ -692,6 +692,30 @@ run:
     # give), so it is a matter of what shapes that aggregation, not of whether
     # it exists. Costs one extra [B, L] history forward per replay step.
     rank_replay: 3
+    # RESIDUAL BOOSTING: rank on MF_dot + channel, not on the channel alone.
+    #
+    # This is the change that addresses the root failure rather than a symptom.
+    # Every other objective asked <UserProfile> to compete with e_u on the same
+    # question, which it cannot win — e_u is 256 free parameters per user fit
+    # directly on the CTR objective over that user's whole training history,
+    # while the profile is a shared function. And the one previous attempt to
+    # help (ui_cond_distill_mf, distilling MF's order) taught the profile to
+    # BECOME e_u, collapsing the body onto the MF-margin axis: redundancy, not
+    # complementarity.
+    #
+    # With MF inside the score, copying it earns nothing — a pair MF already
+    # orders correctly yields almost no gradient — so capacity flows to the
+    # pairs MF gets WRONG. On cold rows, where MF is near chance (measured
+    # MF_dot 0.5591), that is automatically most of them.
+    #
+    # It also makes the objective IDENTICAL to the reported metric:
+    # combined_gain is precisely 'does MF + channel beat MF', which until now
+    # was measured while something else was optimised.
+    #
+    # Watch rank_residual_gain in the zero-init paths line: the loss shrinks it
+    # toward 0 when the channel adds nothing, which is a direct verdict.
+    # False restores the channel-only BPR.
+    rank_residual: True
     probe_every_epochs: 1
     probe_split: valid_ood2.pkl
     # COLD probe. The warm comparison is structurally rigged against the
@@ -705,21 +729,48 @@ run:
     probe_cold: True
     probe_cold_split: test_ood2.pkl
     probe_batch_size: 64
-    # Selection stays on val_gain_repr for now, deliberately: val_probe_gain is a
-    # uAUC DELTA whose epoch-to-epoch noise has not been characterised yet, and
-    # swapping the selection metric and the architecture in the same run would make
-    # the result unattributable. Read the probe for a few runs first, then switch
-    # to `selection_metric: val_probe_gain` — that is what Stage 3 consumes.
-    selection_metric: val_gain_repr
+    # COLD probe gain. This is the metric the project is actually judged on, and
+    # the only one with attainable headroom:
+    #   - warm combined_gain CANNOT go positive. e_u is a free per-user parameter
+    #     fit directly on the CTR objective over that user's whole training
+    #     history, so a shared pooling function cannot out-represent it on users
+    #     seen in training. Selecting on it selects noise.
+    #   - on COLD, MF itself is near chance (measured MF_dot 0.5591 vs 0.5), so the
+    #     bar is low and the ceiling is far away.
+    #   - val_gain_repr, the previous choice, is 88% carried by gain_llm and was
+    #     repeatedly observed rising while everything it does not watch fell.
+    #
+    # CAVEAT, stated because it limits what selection can do: cold gain is a uAUC
+    # DELTA over ~3120 rows (fewer after uAUC drops single-label users), so its
+    # epoch noise is roughly +-0.02-0.03 — the same order as the effects being
+    # chased. selection_ema below smooths it, but the "best" epoch is still partly
+    # a lucky draw. Read the trend over 10 epochs, not the selected value.
+    selection_metric: cold_probe_gain
+    # MUST be set explicitly, and this is a trap: collapse_metric DEFAULTS to
+    # selection_metric, and the guard fires on `collapse_metric < min_collapse_gain`
+    # with min_collapse_gain 0.05. Cold gain sits near 0 (measured -0.007), so
+    # leaving the default would abort every run ~collapse_patience epochs after
+    # warmup. The guard's job is detecting a COLLAPSED representation, not a low
+    # value, so it keeps watching the health metric whose 0.05 threshold was
+    # calibrated for it (config notes it sat at 0.13-0.27 and rising).
+    collapse_metric: val_sem_off_gain_llm
     selection_mode: max
     # Weight on EACH collaborative gain in the composite. 0.5 keeps the
     # alignment term primary while making the pair jointly comparable to it
     # (g_llm ~0.32 vs 0.5*(0.27+0.33) ~0.30 at the peak).
     select_collab_weight: 0.5
-    # Metric the collapse guard watches; defaults to selection_metric so the two
-    # cannot disagree about what "healthy" means. Must be a higher-is-better
-    # gain_* key for the `< min_collapse_gain` comparison to mean anything.
-    collapse_metric: val_gain_repr
+    # collapse_metric is set ABOVE, next to selection_metric — the two have to be
+    # read together now that they are deliberately DIFFERENT metrics. It used to
+    # be duplicated here, and a duplicate YAML key silently takes its LAST value,
+    # so the earlier entry had no effect at all (the same trap that hid
+    # pair_logit_center: False).
+    #
+    # Historical note, still the reason the key exists: it defaulted to
+    # selection_metric "so the two cannot disagree about what healthy means".
+    # That default is exactly wrong once selection tracks a VALUE metric that sits
+    # near zero (cold gain), because the guard's `< min_collapse_gain` test would
+    # then abort every run. The guard must watch a HEALTH metric; selection
+    # watches what we want to maximise.
     # EMA smoothing of the selection metric before the early stopper (0 = off).
     # Late-training improvements are the same order as the metric's epoch noise,
     # so the raw stopper burns patience on noise plateaus and crowns lucky dips
@@ -833,6 +884,19 @@ run:
     # by construction. That is the expected signature, not a bug — if they ever
     # differ, the bank has leaked back into a text loss.
     sem_for_text_losses: False
+    # Mirror of sem_source_dropout, and the missing half of it. That one hides
+    # SEMANTICS so the CF path stays honest; this hides CF so the SEMANTIC path
+    # is trained at all. Needed because data_preprocessing sets
+    # train_["not_cold"] = 1 — EVERY training row is warm — so proj_sem only
+    # ever sees rows where CF already works, and nothing asks semantics to carry
+    # a ranking alone. That is the mechanism behind the two measurements that
+    # have not moved for any architecture change: sem_gain ~ 0 on the warm probe,
+    # and combined_gain 0 on the COLD probe — where e_i is still at its random
+    # init, the Q-Former inherits that, and semantics is the only thing that
+    # could rescue the row.
+    # Train-only, and a no-op when sem_source is off (dropping CF with no
+    # fallback would leave a row with no attendable memory).
+    cf_dropout: 0.3
     # L_llm TARGET bank. Must be distilled with --space input (LLM
     # input-embedding space — the space soft tokens are injected into). The
     # last-hidden file stays on model.qformer_config.item_llm_emb_path for the
