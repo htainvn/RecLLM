@@ -279,6 +279,8 @@ def pooling_usage(qformer, mf, sem_bank, loader, device, max_batches=8):
     expensive way to read one embedding.
     """
     sims = {1: [], 5: [], 10: []}
+    sims_c = {1: [], 5: [], 10: []}
+    off_raw, off_cen = [], []
     for bi, batch in enumerate(loader):
         if bi >= max_batches:
             break
@@ -300,16 +302,38 @@ def pooling_usage(qformer, mf, sem_bank, loader, device, max_batches=8):
             ).float().mean(dim=1)
 
         full = enc(hist)
+        # The RAW cosine cannot be read on its own: the query output is so
+        # anisotropic that two DIFFERENT users already sit at ~0.96 (Stage 1's
+        # offdiag_cos_raw). A cos(full, last1) of 0.97 is then only 0.01 above the
+        # floor, which is compatible both with "ignores the history" and with
+        # "output is near-constant whatever the input" — opposite diagnoses. So
+        # report the across-user floor alongside it, and the CENTERED cosine,
+        # which strips the shared direction and asks whether the ITEM-SPECIFIC
+        # part depends on the history at all.
+        mu = full.mean(dim=0, keepdim=True)
+        off_raw.append(_offdiag_cos(full))
+        off_cen.append(_offdiag_cos(full - mu))
         for k in sims:
             trunc = torch.zeros_like(hist)
             if k < hist.size(1):
                 trunc[:, -k:] = hist[:, -k:]
             else:
                 trunc = hist.clone()
-            sims[k].append(_cosine(full, enc(trunc)).cpu())
-    return {
-        f"val_probe_pool_cos_k{k}": float(torch.cat(v).mean()) for k, v in sims.items() if v
-    }
+            t = enc(trunc)
+            sims[k].append(_cosine(full, t).cpu())
+            # Same reference mean on both sides, so this is one consistent
+            # projection rather than two different centerings.
+            sims_c[k].append(_cosine(full - mu, t - mu).cpu())
+
+    out = {f"val_probe_pool_cos_k{k}": float(torch.cat(v).mean()) for k, v in sims.items() if v}
+    out.update({
+        f"val_probe_pool_cos_centered_k{k}": float(torch.cat(v).mean())
+        for k, v in sims_c.items() if v
+    })
+    if off_raw:
+        out["val_probe_pool_offdiag_raw"] = float(np.mean(off_raw))
+        out["val_probe_pool_offdiag_centered"] = float(np.mean(off_cen))
+    return out
 
 
 @torch.no_grad()

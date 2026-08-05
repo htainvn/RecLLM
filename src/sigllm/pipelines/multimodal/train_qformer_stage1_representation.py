@@ -981,12 +981,23 @@ def train_qformer_stage1_representation(cfg):
         )
         out.update(pool)
         if pool:
+            raw = {k.split("_k")[-1]: v for k, v in pool.items() if "pool_cos_k" in k}
+            cen = {k.split("_k")[-1]: v for k, v in pool.items() if "pool_cos_centered_k" in k}
+            floor_r = pool.get("val_probe_pool_offdiag_raw", float("nan"))
+            floor_c = pool.get("val_probe_pool_offdiag_centered", float("nan"))
             log_step(
                 f"[DIAG ep{epoch_index}] history pooling usage",
-                ", ".join(f"cos(full, last{k.split('_k')[-1]})={v:.4f}" for k, v in sorted(pool.items()))
-                + " | cos ~ 1.0 at last1 means the pooling IGNORES all but the most "
-                "recent item — the Q-Former is then not doing the one job it was "
-                "kept for, and losing to a mask-mean is expected.",
+                "raw cos(full,last k): "
+                + " ".join(f"k{k}={raw[k]:.4f}" for k in sorted(raw, key=int))
+                + f" [across-user floor={floor_r:.4f}] | centered: "
+                + " ".join(f"k{k}={cen[k]:.4f}" for k in sorted(cen, key=int))
+                + f" [floor={floor_c:.4f}]"
+                + " | READ THE CENTERED ROW: the raw cosine sits on an anisotropy "
+                "floor (two different users already ~0.96), so raw alone cannot tell "
+                "'ignores history' from 'output near-constant'. centered k1 ~ 1.0 = the "
+                "item-specific part really does ignore all but the last item -> fix "
+                "attention. centered k1 LOW = the profile does depend on history and the "
+                "raw number was just the shared direction -> fix the anisotropy.",
             )
         sem_part = ""
         if "val_probe_sem_gain" in out:
