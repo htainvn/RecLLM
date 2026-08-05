@@ -654,12 +654,21 @@ run:
     # qformer pkl carries POSITIVES only, and via UserGroupedSampler because a
     # batch without same-user pos/neg pairs makes the loss silently return 0.
     #
-    # 0.0 disables (exact previous behaviour). Start at 1.0: it should be
-    # comparable to w_ui, which it is meant to correct rather than replace.
-    # It fits HELD-IN labels so it can memorise — judge it by val_probe_gain,
-    # not by its own train value or rank_acc.
-    w_rank: 1.0
-    tau_rank: 1.0
+    # 0.0 disables (exact previous behaviour). 0.15, NOT 1.0: tau_rank dropped
+    # from 1.0 to 0.05 below, and softplus(-x/tau) scales its gradient by 1/tau,
+    # so the same weight would have multiplied this term's gradient by ~20x. The
+    # first version of this loss ran at w=1.0 with a DOT-product score and drove
+    # the probe steadily more negative every epoch; do not hand it a 20x larger
+    # gradient on the retry. Raise it only after val_probe_gain is seen rising.
+    #
+    # It fits HELD-IN labels so it can memorise — judge it by val_probe_gain, not
+    # by its own train value or rank_acc.
+    w_rank: 0.15
+    # 0.05, not 1.0: the BPR now scores a COSINE (matching the probe), and
+    # cosine margins are O(0.01-0.1) given the query anisotropy — at tau=1.0
+    # softplus sits at ~ln 2 and delivers almost no gradient. Same tau-scaling
+    # lesson as tau_ii / tau_ui.
+    tau_rank: 0.05
     rank_split: train_ood2.pkl
     rank_batch_size: 64
     rank_items_per_user: 8

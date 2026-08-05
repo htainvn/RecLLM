@@ -321,7 +321,14 @@ def probe_metrics(qformer, mf, sem_bank, loader, device, prefix="val_probe"):
     qf_cen = _cosine(pc, tc).numpy()
     mf_dot = (enc["mf_user"] * enc["mf_item"]).sum(-1).numpy()
 
+    # DOT as well as cosine. The cosine discards ||target_q||, and that norm
+    # carries real ranking signal here: measured cos(e_u, e_t) = 0.583 against
+    # e_u . e_t = 0.6437 on the same rows. A change that lands in the norm is
+    # invisible to the cosine, so reporting only cosine can read as "no progress"
+    # (or as a regression) while the dot readout improves.
+    qf_dot = (enc["profile_q"] * enc["target_q"]).sum(-1).numpy()
     out = {
+        f"{prefix}_uauc_dot": uauc(qf_dot),
         f"{prefix}_uauc": uauc(qf_raw),
         f"{prefix}_auc": auc(qf_raw),
         f"{prefix}_uauc_centered": uauc(qf_cen),
@@ -331,8 +338,11 @@ def probe_metrics(qformer, mf, sem_bank, loader, device, prefix="val_probe"):
     }
     # Best of raw/centered vs MF: which of the two the loss happens to favour is
     # an implementation detail of the scoring head, not of the channel.
+    # Best of the three readouts: which one the channel happens to express its
+    # signal in is an implementation detail of the scoring head, not of the
+    # channel's information content.
     out[f"{prefix}_gain"] = (
-        max(out[f"{prefix}_uauc"], out[f"{prefix}_uauc_centered"])
+        max(out[f"{prefix}_uauc"], out[f"{prefix}_uauc_centered"], out[f"{prefix}_uauc_dot"])
         - out[f"{prefix}_mf_dot_uauc"]
     )
 

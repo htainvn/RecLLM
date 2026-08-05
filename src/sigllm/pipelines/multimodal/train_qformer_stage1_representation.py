@@ -984,7 +984,8 @@ def train_qformer_stage1_representation(cfg):
         log_step(
             f"[DIAG ep{epoch_index}] uAUC probe (within-user, the real task)",
             f"channel_uauc={out['val_probe_uauc']:.4f} "
-            f"centered={out['val_probe_uauc_centered']:.4f} | "
+            f"centered={out['val_probe_uauc_centered']:.4f} "
+            f"dot={out['val_probe_uauc_dot']:.4f} | "
             f"MF_dot={out['val_probe_mf_dot_uauc']:.4f} "
             f"MF_hist_cos={out['val_probe_mf_hist_cos_uauc']:.4f} | "
             f"GAIN={out['val_probe_gain']:+.4f} over MF on {int(out['val_probe_rows'])} rows "
@@ -1252,8 +1253,28 @@ def train_qformer_stage1_representation(cfg):
         if rank_steps:
             rank_log_str = (
                 f"L_rank={rank_loss_sum / rank_steps:.4f} "
-                f"rank_acc={(rank_acc_sum / rank_acc_n) if rank_acc_n else float('nan'):.4f}"
+                f"rank_acc={(rank_acc_sum / rank_acc_n) if rank_acc_n else float('nan'):.4f} "
+                f"rank_pairs={rank_acc_n}/{rank_steps}"
             )
+            # _per_user_pairwise_loss returns a graph-preserving 0 when a batch
+            # holds no same-user (pos, neg) pair, so a mis-grouped sampler makes
+            # the term vanish SILENTLY — it would look configured while adding
+            # nothing but an extra forward. rank_pairs counts the batches that
+            # actually contributed.
+            if rank_acc_n == 0:
+                log_step(
+                    "WARNING",
+                    "w_rank > 0 but NO batch contained a same-user (pos, neg) pair, so "
+                    "the BPR contributed exactly nothing. Raise rank_items_per_user or "
+                    "rank_batch_size — UserGroupedSampler needs several rows per user "
+                    "with MIXED labels in one batch.",
+                )
+            elif rank_acc_n < 0.5 * rank_steps:
+                log_step(
+                    "WARNING",
+                    f"only {rank_acc_n}/{rank_steps} BPR batches had a valid pair; the "
+                    f"term is mostly inactive. Raise rank_items_per_user.",
+                )
         if (epoch + 1) % cfg.log_epoch == 0:
             avg_train = accumulator.result()
             val_logs = evaluate_loss(

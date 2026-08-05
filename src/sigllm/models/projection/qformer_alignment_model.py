@@ -857,7 +857,20 @@ class QRecInstructAlignmentModel(nn.Module):
         )
         target_q = self.qformer.encode_cf(item_cf, sem_vec=self._sem_for(item_ids))
 
-        scores = (profile_q.mean(dim=1) * target_q.mean(dim=1)).sum(dim=-1)
+        # COSINE, not the dot product. Scoring the dot was a real bug: within one
+        # user profile_q is near-fixed, so dot-ranking == ranking by
+        # ||target_q|| * cos, and the loss can be satisfied purely by inflating
+        # the norm of positive items — a channel the cosine metric cannot see,
+        # while the norm inflation distorts direction as a side effect. Loss went
+        # down and the probe's uAUC went DOWN with it, every epoch. The loss and
+        # the metric have to read the same thing.
+        #
+        # tau matters here for the same reason it did for the pair logits: cosine
+        # margins are O(0.01-0.1) given the anisotropy, so at tau=1.0 softplus
+        # sits at ~ln 2 with almost no gradient. Use tau ~0.05.
+        u_vec = F.normalize(profile_q.mean(dim=1), dim=-1)
+        i_vec = F.normalize(target_q.mean(dim=1), dim=-1)
+        scores = (u_vec * i_vec).sum(dim=-1)
         loss = _per_user_pairwise_loss(scores, user_ids, labels, tau)
         with torch.no_grad():
             acc = _per_user_pairwise_acc(scores, user_ids, labels)
