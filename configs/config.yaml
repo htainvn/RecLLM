@@ -672,6 +672,16 @@ run:
     rank_split: train_ood2.pkl
     rank_batch_size: 64
     rank_items_per_user: 8
+    # BPR batches replayed per Q-Former step. Raises the history path's SHARE
+    # of the gradient without inflating this term's per-batch magnitude (which
+    # is already 20x larger since tau_rank went to 0.05). Measured need: only
+    # ~1.45 of ~4.05 total loss weight touches history pooling, while 2.6
+    # trains the shared body on SINGLE-ITEM encodes — and the pooling
+    # diagnostic confirms the body DOES aggregate the history (centered
+    # cos(full,last1)=0.243, far from the ~1.0 that collapsed attention would
+    # give), so it is a matter of what shapes that aggregation, not of whether
+    # it exists. Costs one extra [B, L] history forward per replay step.
+    rank_replay: 3
     probe_every_epochs: 1
     probe_split: valid_ood2.pkl
     probe_batch_size: 64

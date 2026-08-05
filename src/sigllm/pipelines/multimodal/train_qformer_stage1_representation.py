@@ -936,6 +936,7 @@ def train_qformer_stage1_representation(cfg):
     # USER-GROUPED sampler, or batches hold no same-user pos/neg pair and the
     # loss silently returns 0.
     w_rank = float(cfg.get("w_rank", 0.0))
+    rank_replay = max(1, int(cfg.get("rank_replay", 1)))
     tau_rank = float(cfg.get("tau_rank", 1.0))
     rank_loader = None
     rank_iter = None
@@ -964,7 +965,7 @@ def train_qformer_stage1_representation(cfg):
             log_step(
                 "Within-user BPR ACTIVE",
                 f"w_rank={w_rank}, tau={tau_rank}, split={cfg.get('rank_split', 'train_ood2.pkl')}, "
-                f"rows={len(rank_ds)}, batch={rank_bs}, items_per_user="
+                f"rows={len(rank_ds)}, batch={rank_bs}, replay={rank_replay}/step, items_per_user="
                 f"{int(cfg.get('rank_items_per_user', 8))}. Watch rank_acc (0.5 = chance) "
                 f"and, more importantly, val_probe_gain — L_rank fits held-in labels so it "
                 f"CAN memorise, exactly like L_ui.",
@@ -1240,7 +1241,15 @@ def train_qformer_stage1_representation(cfg):
             # loss_user_rank. Replayed from its own loader because the qformer
             # pkl carries POSITIVES only (no negatives to pair against) and the
             # BPR needs same-user pos/neg rows in one batch.
-            if rank_iter is not None:
+            # REPLAY several BPR batches per Q-Former step, not one. Measured
+            # reason: only ~1.45 of the ~4.05 total loss weight touches the
+            # history-pooling path (L_ui 1.0 + L_uic 0.3 + L_rank), while 2.6
+            # (ITC 0.3 + ITG 1.0 + L_llm 1.0 + L_ii 0.3) trains the shared body on
+            # SINGLE-ITEM (S=1) encodes. Raising w_rank instead would inflate this
+            # term's per-batch gradient — already 20x larger since tau_rank went to
+            # 0.05 — whereas extra replay steps raise its SHARE of the gradient at
+            # unchanged magnitude. Same correction Stage 2 makes with w_ui_keep.
+            for _ in range(rank_replay if rank_iter is not None else 0):
                 rank_batch = next(rank_iter, None)
                 if rank_batch is None:               # loader exhausted -> restart
                     rank_iter = iter(rank_loader)
