@@ -280,13 +280,35 @@ def measure_raw_signal(mf_state, samples, args, label):
 
     if ui and user_emb is not None:
         report(
-            "user_item",
+            "user_item(e_u)  ",
             torch.tensor([u for u, _ in ui], dtype=torch.long),
             torch.tensor([i for _, i in ui], dtype=torch.long),
             user_emb, item_emb, args.tau_ui, args.n_ui,
         )
     else:
         print("  [skip] no user_item samples (or no user_embedding) in the pkl")
+
+    # The FAIR ceiling for Stage 1's L_ui. Its user side is the POOLED HISTORY
+    # (see _user_source: with history_ids the user is the padded item sequence,
+    # deliberately, so the pooling matches Stage 3's <UserProfile>), NOT the MF
+    # user vector. e_u is directly optimised by the MF's own BCE for e_u . e_i,
+    # so comparing g_ui against an e_u ceiling overstates the headroom; a
+    # mean-pooled history is the thing the Q-Former is actually approximating.
+    hist = [(s.get("his") or [], int(s["i_left"])) for s in samples
+            if s.get("sample_type") == "user_item"]
+    hist = [(h, i) for h, i in hist if h]
+    if hist:
+        pooled = torch.stack([
+            item_emb[torch.tensor(h, dtype=torch.long)].float().mean(dim=0) for h, _ in hist
+        ])
+        report(
+            "user_item(hist) ",
+            torch.arange(pooled.size(0)),
+            torch.tensor([i for _, i in hist], dtype=torch.long),
+            pooled, item_emb, args.tau_ui, args.n_ui,
+        )
+    else:
+        print("  [skip] user_item samples carry no 'his' (older pkl)")
 
 
 def main():
