@@ -260,7 +260,18 @@ model:
     #   code does (pretrained_with_small=False); the warm start is a SigLLM
     #   addition. Turning it off also removes the last-hidden-space mismatch.
     id_proj_norm: False
-    id_proj_warm_start: True
+    # SeLLa calls prepare_collm_prompt(..., pretrained_with_small=False) with
+    # projection_model_path=None — it NEVER warm-starts the projection from the
+    # MF's trans_1/trans_2. The warm start is a SigLLM addition, and it feeds
+    # weights the MF's InfoNCE trained toward LAST-HIDDEN space into an INPUT
+    # embedding slot. Worse, that InfoNCE L2-normalises both sides, so it never
+    # constrained trans_2's output MAGNITUDE at all. False = SeLLa.
+    id_proj_warm_start: False
+    # SeLLa's LinearProjection never re-initialises — it keeps PyTorch's default
+    # Linear init. SigLLM used std=0.02 on both layers, which shrinks the output:
+    #   measured ||id_proj(e_u)|| = 0.27 vs ~1.2 for a real Qwen2 embedding.
+    #   default = SeLLa.   small = the original SigLLM std=0.02.
+    id_proj_init: default
 
     # SeLLa freezes LoRA at step 3 — step 1 already adapted the LLM to the task,
     # and this stage trains the collaborative side against it. true makes LoRA
@@ -1077,44 +1088,66 @@ run:
     # numbers, so it is an error, not a warning.
     lora_from: sella_step1
 
-    # MF joins the trainable set, as SeLLa does at its final step, in its own
-    # optimizer param group. rec_lr_scale 3.33 * init_lr 3e-5 ~= 1e-4 for the
-    # embeddings — same setting as qformer_stage3_step2, which is where the
-    # comparable number comes from. Watch the "MF drift" log line: rising drift
-    # with flat val uAUC means lower this. Set true to hold MF fixed and isolate
-    # the Q-Former's contribution alone.
-    freeze_rec: false
-    rec_lr_scale: 3.33
-    rec_weight_decay: 1e-4
-
-    init_lr: 3e-5
-    # Must be set together with init_lr — the top-level min_lr (8e-5) is ABOVE
-    # this, which would invert the cosine schedule into a climb.
-    min_lr: 3e-6
-    max_epoch: 30
-
-    # SMALLER than the top-level 16, and that is about the loss, not the model.
-    # SeLLa's objective is full-vocabulary LM cross-entropy over the whole
-    # sequence, where QRecLLM's touched ONE position. With Qwen2's 151936-token
-    # vocab, the fp32 logits for the supervised positions cost ~0.6 MB per
-    # PROMPT TOKEN per sample, plus as much again inside cross_entropy. At
-    # datasets.movie_ood.max_history_length=10 (SeLLa's cap) the prompt runs
-    # ~86-120 tokens, so only ~0.1-0.15 GB/sample transient — batch 8 costs
-    # ~1 GB, and batch 16-32 is comfortable if you want the throughput (halve
-    # iters_per_epoch to keep samples/epoch comparable).
-    # This term scales LINEARLY in prompt length, so if you raise the history
-    # cap, re-check it: at cap 50 the same batch costs ~4x more.
+    # ================= SeLLa step-3 BUDGET PARITY =====================
+    # Read off SeLLa/codes/step3_train_sella/train_sella.sh:
+    #   num_train_epochs 1 | batch 5 x grad_accum 30 x 2 GPU = effective 300
+    #   learning_rate 2e-4 | cosine | warmup_ratio 0 | weight_decay 0.01
+    # On ml-1m (32615 train rows after min_positive_history=2) that is
+    #   32615 / 300 ~= 109 OPTIMIZER UPDATES for the ENTIRE run.
     #
-    # If it still OOMs, in order of preference:
-    #   1. model.sella_gated.lm_loss_scope=answer  (supervises 1 position per
-    #      sample; the memory term all but disappears)
-    #   2. lower this
-    #   3. lower datasets.movie_ood.max_history_length (shortens the prompt)
+    # This turned out to matter more than any other single setting. The first
+    # long run reached 800 updates by its epoch-0 eval (7.4x SeLLa's whole run,
+    # AUC 0.752 / uAUC 0.698) and 1600 by epoch 1 (14.7x, collapsed to
+    # 0.636 / 0.618). max_epoch 30 would have been 221x. Under SeLLa's
+    # full-sequence LM CE the soft tokens get driven toward a constant if you
+    # keep going — SeLLa simply stops long before that.
+    #
+    # Reproduced here at 8 x 38 = effective 304 and 110 updates, but split over
+    # 5 "epochs" so there are 5 eval points instead of 1: the peak is early and
+    # a single end-of-run number cannot see it.
+    #   8 x 836 = 6688 samples/epoch; 836/38 = 22 updates/epoch; x5 = 110.
+    # Sanity check on the target: lr x updates is ~the same for SeLLa
+    # (2e-4 x 109 = 0.022) and for that run's epoch 0 (3e-5 x 800 = 0.024), so
+    # this budget should land NEAR 0.75/0.70 on valid, not above it.
+    #
+    # To train LONGER than SeLLa on purpose, raise max_epoch AND set
+    # model.sella_gated.lm_loss_scope=answer — `full` does not survive it.
+    accum_grad_iters: 38
     batch_size_train: 8
     batch_size_eval: 16
-    # Doubled from the top-level 400 so samples-per-epoch stays at 6400 despite
-    # the halved batch — keeps "epoch" comparable to the other stages' logs.
-    iters_per_epoch: 800
+    iters_per_epoch: 836
+    max_epoch: 5
+    init_lr: 2e-4        # SeLLa
+    min_lr: 2e-5         # cosine floor; SeLLa decays across its single epoch
+    warmup_steps: 0      # SeLLa warmup_ratio 0
+    weight_decay: 0.01   # SeLLa
+
+    # MF joins the trainable set, as SeLLa does at its final step. SeLLa has NO
+    # separate MF learning rate — everything trainable moves at 2e-4 — so parity
+    # is rec_lr_scale 1.0. Watch the "MF drift" log line; set freeze_rec true to
+    # hold MF fixed and isolate the Q-Former's contribution alone.
+    freeze_rec: false
+    rec_lr_scale: 1.0
+    rec_weight_decay: 1e-4
+
+
+    # MEMORY NOTE (batch_size_train / batch_size_eval are set in the budget block
+    # above, since they are part of reaching SeLLa's effective batch of 300).
+    # SeLLa's objective is full-vocabulary LM cross-entropy over the whole
+    # sequence, where QRecLLM's touched ONE position. With Qwen2's 151936-token
+    # vocab the fp32 logits for the supervised positions cost ~0.6 MB per PROMPT
+    # TOKEN per sample, plus as much again inside cross_entropy. At
+    # datasets.movie_ood.max_history_length=10 (SeLLa's cap) the prompt runs
+    # ~86-120 tokens, so ~0.1-0.15 GB/sample transient — batch 8 costs ~1 GB.
+    # This scales LINEARLY in prompt length: at cap 50 the same batch costs ~4x.
+    #
+    # If it OOMs, in order of preference:
+    #   1. raise accum_grad_iters and lower batch_size_train by the same factor
+    #      (keeps the effective batch, and therefore SeLLa parity, intact)
+    #   2. model.sella_gated.lm_loss_scope=answer (supervises 1 position/sample;
+    #      the memory term all but disappears — but see the note there, it is a
+    #      departure from SeLLa)
+    #   3. lower datasets.movie_ood.max_history_length (shortens the prompt)
 
   # Optimization
   lr_sched: "linear_warmup_cosine_lr"

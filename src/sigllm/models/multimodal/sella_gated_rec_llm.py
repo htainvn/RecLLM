@@ -28,11 +28,26 @@ those positions mean anything. This model takes the opposite stance on all three
    the USER representation using history conditioned on the candidate, which is
    what a user token is for.
 
-2. **SeLLa's loss and SeLLa's eval.** Training is full-sequence LM
-   cross-entropy; the Yes/No softmax is extracted only at eval, and AUC/uAUC are
-   computed from it by ``RecBaseTask``. The auxiliary ``ranking_loss`` /
+2. **SeLLa's eval; SeLLa's loss available but NOT the default.** Scoring is
+   SeLLa's: the Yes/No softmax at the answer position, with AUC/uAUC computed
+   from it by ``RecBaseTask``. The auxiliary ``ranking_loss`` /
    ``align_rank_loss`` terms from the config are deliberately NOT read here
    (``__init__`` logs that they are ignored).
+
+   The training objective started as SeLLa's full-sequence LM cross-entropy and
+   was changed to ``lm_loss_scope='answer'`` on evidence. Measured:
+
+       epoch 0   val_loss 1.589809   AUC 0.752483   uAUC 0.697958
+       epoch 1   val_loss 1.583828   AUC 0.635533   uAUC 0.618170
+
+   The loss went DOWN while AUC/uAUC collapsed. ``full`` supervises ~86 positions
+   of which exactly ONE is the answer; the other ~85 ask the model to predict the
+   next PROMPT token, and this prompt is near-identical across samples, so the
+   cheapest way to make it more predictable is to drive the soft tokens toward a
+   CONSTANT — i.e. to erase the per-user / per-item information the channel
+   exists to carry. ``scope='full'`` is still selectable for the parity claim,
+   and note that epoch 0 under it BEAT the baseline (0.752/0.698): the channel
+   works, the objective then trains it away.
 
 3. **No Stage 1, no Stage 2.** The Q-Former trains jointly in this step from a
    fresh init. With ~4.3M parameters behind a zero-init gate there is nothing for
@@ -71,8 +86,9 @@ LOGGER = NotebookLogger.rich_logger("sigllm.sella_gated_rec_llm")
 #                clean variant: predicting the placeholder token id is not a
 #                meaningful objective, and here all three slots share ONE
 #                reserved id, so `full` spends gradient on "emit the placeholder".
-#   answer       only the Yes/No answer token(s) — the cheapest, and the closest
-#                to what QRecLLM's 2-way CE optimised.
+#   answer       (DEFAULT) only the Yes/No answer token(s). The objective the
+#                0.729/0.690 baseline used, and the only scope that removes the
+#                erase-the-soft-tokens pressure documented in the class docstring.
 LM_LOSS_SCOPES = ("full", "full_no_soft", "answer")
 
 
@@ -131,7 +147,8 @@ class SeLLaGatedRecLLM(Rec2Base):
         qformer_delta_scale="match_ref",
         ablate_qformer=False,
         id_proj_norm=False,
-        id_proj_warm_start=True,
+        id_proj_warm_start=False,
+        id_proj_init="default",
         lm_loss_scope="full",
         gate_log_steps=50,
         mf_drift_log_steps=200,
@@ -154,6 +171,9 @@ class SeLLaGatedRecLLM(Rec2Base):
         self.lora_dropout = float(lora_dropout)
         self.id_proj_norm = bool(id_proj_norm)
         self.id_proj_warm_start = bool(id_proj_warm_start)
+        if id_proj_init not in ("default", "small"):
+            raise ValueError(f"id_proj_init must be 'default' or 'small', got {id_proj_init!r}")
+        self.id_proj_init = id_proj_init
         self.gate_log_steps = int(gate_log_steps)
         self.mf_drift_log_steps = int(mf_drift_log_steps)
         self._item_sem_emb_path = item_sem_emb_path
@@ -443,10 +463,17 @@ class SeLLaGatedRecLLM(Rec2Base):
         if self.id_proj_norm:
             layers.append(nn.LayerNorm(H))
         self.id_proj = nn.Sequential(*layers)
-        nn.init.normal_(self.id_proj[0].weight, std=0.02)
-        nn.init.zeros_(self.id_proj[0].bias)
-        nn.init.normal_(self.id_proj[2].weight, std=0.02)
-        nn.init.zeros_(self.id_proj[2].bias)
+        if self.id_proj_init == "small":
+            # SigLLM's original: std=0.02 on both Linears. Shrinks the output —
+            # measured ||id_proj(e_u)|| = 0.27 vs ~1.2 for a real Qwen2 embedding.
+            nn.init.normal_(self.id_proj[0].weight, std=0.02)
+            nn.init.zeros_(self.id_proj[0].bias)
+            nn.init.normal_(self.id_proj[2].weight, std=0.02)
+            nn.init.zeros_(self.id_proj[2].bias)
+        # "default" leaves PyTorch's Linear init untouched, which is exactly what
+        # SeLLa's LinearProjection uses (it never re-initialises). Each default
+        # Linear preserves per-coordinate std up to 1/sqrt(3), so the output norm
+        # lands near ||e_u|| rather than far below it.
         if self.id_proj_norm:
             # Same scaling warm_proj uses: LayerNorm output has unit variance per
             # dim, so weight = H**-0.5 puts the vector's norm near 1 — the order
@@ -1077,7 +1104,8 @@ class SeLLaGatedRecLLM(Rec2Base):
             qformer_delta_scale=str(sella.get("delta_scale", "match_ref")),
             ablate_qformer=bool(sella.get("ablate_qformer", False)),
             id_proj_norm=bool(sella.get("id_proj_norm", False)),
-            id_proj_warm_start=bool(sella.get("id_proj_warm_start", True)),
+            id_proj_warm_start=bool(sella.get("id_proj_warm_start", False)),
+            id_proj_init=str(sella.get("id_proj_init", "default")),
             lm_loss_scope=str(sella.get("lm_loss_scope", "full")),
             gate_log_steps=int(sella.get("gate_log_steps", 50)),
             mf_drift_log_steps=int(cfg.get("mf_drift_log_steps", 200)),

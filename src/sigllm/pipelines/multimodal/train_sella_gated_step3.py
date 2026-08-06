@@ -191,6 +191,14 @@ def apply_overrides(cfg, slug):
         cfg.run_cfg.batch_size_eval = stage.batch_size_eval
     if "iters_per_epoch" in stage:
         cfg.run_cfg.iters_per_epoch = stage.iters_per_epoch
+    # SeLLa reaches its effective batch of 300 through gradient accumulation
+    # (5 x 30 x 2 GPU), and its whole run is ~109 optimizer updates. Without
+    # accum_grad_iters the runner takes one update per batch, which is how the
+    # first long run ended up at 7.4x SeLLa's total update count by its FIRST
+    # eval — and then collapsed.
+    for key in ("accum_grad_iters", "weight_decay", "warmup_steps"):
+        if key in stage:
+            cfg.run_cfg[key] = stage[key]
 
     # --- things this model deliberately does NOT use ----------------------
     # The objective is SeLLa's LM cross-entropy. The two per-user BPR auxiliaries
@@ -227,6 +235,29 @@ def apply_overrides(cfg, slug):
         float(stage.init_lr) * float(stage.rec_lr_scale),
         stage.rec_weight_decay,
     )
+    # Budget parity against SeLLa, stated in the one unit that actually predicts
+    # the collapse: optimizer updates. SeLLa step 3 = 1 epoch at effective batch
+    # 300 = ~109 updates on ml-1m. Print ours next to it so an over-trained
+    # configuration is visible before the run rather than after.
+    accum = max(1, int(cfg.run_cfg.get("accum_grad_iters", 1)))
+    eff_batch = int(cfg.run_cfg.batch_size_train) * accum
+    updates = int(cfg.run_cfg.max_epoch) * int(cfg.run_cfg.iters_per_epoch) // accum
+    samples = int(cfg.run_cfg.max_epoch) * int(cfg.run_cfg.iters_per_epoch) * int(cfg.run_cfg.batch_size_train)
+    LOGGER.info(
+        "Budget | effective batch = %d x %d = %d | %d optimizer updates over %d "
+        "sample-visits | %d eval points. SeLLa step 3 = ~109 updates at effective "
+        "batch 300 (1 epoch). Ratio vs SeLLa: %.1fx.",
+        int(cfg.run_cfg.batch_size_train), accum, eff_batch, updates, samples,
+        int(cfg.run_cfg.max_epoch), updates / 109.0,
+    )
+    if updates > 400:
+        LOGGER.warning(
+            "%d updates is %.0fx SeLLa's entire step 3. Under lm_loss_scope=full "
+            "that regime erased the soft tokens (AUC 0.752 -> 0.636 between 800 "
+            "and 1600 updates). If you intend to train this long, switch to "
+            "model.sella_gated.lm_loss_scope=answer.",
+            updates, updates / 109.0,
+        )
     if was_grouped:
         LOGGER.info(
             "Disabled run.user_grouped_batch (was enabled): it exists for the "
