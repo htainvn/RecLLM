@@ -199,6 +199,34 @@ model:
     # on if the gate grows but uAUC does not.
     hist_target_fusion: False
 
+    # How the gated term's MAGNITUDE is controlled. THE fix for the first run's
+    # regression (AUC 0.729 -> 0.606, uAUC 0.69 -> 0.586).
+    #
+    # What went wrong: out_proj is an unconstrained Linear(256, 3584). Measured
+    # from that run's own log (gate=-0.047781, delta_norm=3.288740,
+    # delta_rel=12.204657):
+    #     ||id_proj(e_u)||  = 0.27      <- the token being added to
+    #     ||delta|| raw     = 68.8      <- 255x that
+    #     ||g * delta||     = 3.29      <- still 12x after the gate
+    # So <UserID> was not refined, it was REPLACED by a vector ~2.7x the norm of
+    # a real Qwen2 embedding — out of distribution, and with LoRA frozen the LLM
+    # cannot adapt. A single scalar gate cannot absorb a 255x mismatch: it also
+    # made dL/dgate ~800x larger than it should be, so the gate itself thrashed
+    # (it ended NEGATIVE).
+    #
+    #   match_ref  (default) out_proj controls DIRECTION, gate controls magnitude
+    #              in units of the reference token:
+    #                  gated = g * ||e_user|| * delta/||delta||
+    #              so ||gated||/||e_user|| == |g| EXACTLY. This is what makes the
+    #              reported g a real contribution ratio at any point in training:
+    #              g = 0.1 means "10% of the user token", full stop.
+    #   unit       ||gated|| == |g|, absolute rather than relative to e_user.
+    #   none       the raw out_proj output — i.e. the original behaviour. Kept
+    #              only to reproduce the regression on demand.
+    #
+    # g = 0 remains an exact no-op in all three modes.
+    delta_scale: match_ref
+
     # Semantic-slot source. Left null it falls back to
     # model.qformer_config.item_llm_emb_path. The preferred source is actually
     # neither file but the MF's live, TRAINED item_embedding_llm table (present
@@ -210,6 +238,29 @@ model:
     # (model.qformer_config.warm_token above is False for QRecLLM's own runs;
     # that key is not read here.)
     warm_token: True
+
+    # --- scale of what actually lands in the prompt ----------------------
+    # These two exist because a mis-scaled soft token produces NO error, just a
+    # worse uAUC. `id_proj` maps e_u / e_i into the prompt as INPUT embeddings,
+    # but its warm start comes from the MF's trans_1/trans_2, which the MF's
+    # InfoNCE trained to land in the LLM's LAST-HIDDEN space. In a 7B model those
+    # differ in norm by an order of magnitude, and unlike warm_proj (Linear +
+    # LayerNorm) id_proj has no normalisation to absorb it. With LoRA frozen the
+    # LLM cannot adapt to an out-of-distribution token either.
+    #
+    # Read the "Soft-token scale vs real token embeddings" log line: it prints
+    # each soft token's mean L2 next to the real token embeddings' in the same
+    # batch. A ratio near 1 is healthy; >5x or <0.2x triggers a
+    # "!! SOFT-TOKEN SCALE MISMATCH" line and means the collaborative channel is
+    # being injected as noise.
+    #
+    # id_proj_norm: append a LayerNorm scaled to H**-0.5 (exactly warm_proj's
+    #   treatment), which pins the output norm near a real embedding's.
+    # id_proj_warm_start: false = fresh init, which is what SeLLa's own shipped
+    #   code does (pretrained_with_small=False); the warm start is a SigLLM
+    #   addition. Turning it off also removes the last-hidden-space mismatch.
+    id_proj_norm: False
+    id_proj_warm_start: True
 
     # SeLLa freezes LoRA at step 3 — step 1 already adapted the LLM to the task,
     # and this stage trains the collaborative side against it. true makes LoRA

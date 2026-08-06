@@ -77,6 +77,14 @@ import torch
 import torch.nn as nn
 
 
+# How the gated term's MAGNITUDE is controlled. See the block in `forward`.
+#   match_ref  ||g*delta|| == |g| * ||e_user||  -> delta_rel == |g| exactly. Default.
+#   unit       ||g*delta|| == |g|               -> absolute, reference-independent.
+#   none       raw out_proj output              -> the original behaviour, which
+#              measured 255x the token it was added to. Kept only to reproduce it.
+DELTA_SCALES = ("match_ref", "unit", "none")
+
+
 class _QFormerLayer(nn.Module):
     """One Q-Former block: self-attn over queries, cross-attn into memory, FFN.
 
@@ -129,8 +137,12 @@ class GatedHistoryQFormer(nn.Module):
         use_sem: bool = True,
         use_user_slot: bool = True,
         hist_target_fusion: bool = False,
+        delta_scale: str = "match_ref",
     ):
         super().__init__()
+        if delta_scale not in DELTA_SCALES:
+            raise ValueError(f"delta_scale must be one of {DELTA_SCALES}, got {delta_scale!r}")
+        self.delta_scale = delta_scale
         if d_model % num_heads != 0:
             raise ValueError(f"d_model={d_model} must be divisible by num_heads={num_heads}")
         if num_queries < 1:
@@ -228,6 +240,7 @@ class GatedHistoryQFormer(nn.Module):
             f"sem_slots={'on(d_sem=%d)' % self.d_sem if self.uses_sem else 'off'}",
             f"user_target_slot={'on' if self.fuse_user is not None else 'off'}",
             f"hist_target_fusion={'on' if self.hist_target_fusion else 'off'}",
+            f"delta_scale={self.delta_scale}",
             "text_branch=off",
             f"params={total / 1e6:.2f}M",
         ]
@@ -311,6 +324,40 @@ class GatedHistoryQFormer(nn.Module):
             x = layer(x, memory, ~valid)
 
         delta = self.out_proj(x.mean(dim=1))
+
+        # --- scale control: the difference between a gated contribution and a
+        # --- replacement of the token it is added to.
+        #
+        # `out_proj` is an unconstrained Linear(d_model, d_out). With d_out=3584
+        # its output norm is ~25 at init and grows from there, while the
+        # `id_proj(e_u)` it is added to has norm ~0.27 — a measured 255x gap. A
+        # single scalar gate cannot fix that: it shrank to 0.048 and the gated
+        # term was still 12x the user token, i.e. `<UserID>` was not being
+        # refined, it was being REPLACED by an out-of-distribution vector, and
+        # with LoRA frozen the LLM could not adapt. uAUC fell ~0.10 below the
+        # text-only baseline.
+        #
+        # `match_ref` (default) makes `out_proj` responsible for DIRECTION only
+        # and the gate for magnitude, in units of the reference token:
+        #     gated = g * ||e_user|| * (delta / ||delta||)
+        # so ||gated|| / ||e_user|| == |g| EXACTLY. That is what makes the
+        # reported `g` a real contribution ratio rather than a number whose
+        # meaning depends on out_proj's arbitrary scale — g = 0.1 means "10% of
+        # the user token", at any point in training.
+        #
+        # The norm in the denominator is NOT detached (so gradients shape the
+        # direction correctly), while the reference norm IS (so the scale does
+        # not leak gradient back into id_proj).
+        if self.delta_scale in ("match_ref", "unit"):
+            direction = delta / delta.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            if self.delta_scale == "match_ref" and reference is not None:
+                scale = reference.detach().to(delta.dtype).norm(dim=-1, keepdim=True)
+            else:
+                scale = torch.ones(1, 1, dtype=delta.dtype, device=delta.device)
+            delta = direction * scale
+        # "none" keeps the raw out_proj output — the original, broken behaviour,
+        # retained only so the regression can be reproduced on demand.
+
         gated = self.gate.to(delta.dtype) * delta
 
         with torch.no_grad():

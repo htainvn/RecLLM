@@ -128,7 +128,10 @@ class SeLLaGatedRecLLM(Rec2Base):
         qformer_use_sem=True,
         qformer_use_user_slot=True,
         qformer_hist_target_fusion=False,
+        qformer_delta_scale="match_ref",
         ablate_qformer=False,
+        id_proj_norm=False,
+        id_proj_warm_start=True,
         lm_loss_scope="full",
         gate_log_steps=50,
         mf_drift_log_steps=200,
@@ -149,6 +152,8 @@ class SeLLaGatedRecLLM(Rec2Base):
         self.lora_alpha = int(lora_alpha)
         self.lora_target_modules = tuple(lora_target_modules)
         self.lora_dropout = float(lora_dropout)
+        self.id_proj_norm = bool(id_proj_norm)
+        self.id_proj_warm_start = bool(id_proj_warm_start)
         self.gate_log_steps = int(gate_log_steps)
         self.mf_drift_log_steps = int(mf_drift_log_steps)
         self._item_sem_emb_path = item_sem_emb_path
@@ -181,6 +186,7 @@ class SeLLaGatedRecLLM(Rec2Base):
             use_sem=qformer_use_sem,
             use_user_slot=qformer_use_user_slot,
             hist_target_fusion=qformer_hist_target_fusion,
+            delta_scale=qformer_delta_scale,
         )
         self._init_prompts(prompt_path, prompt_template, max_txt_len, end_sym)
         self._apply_freeze_policy()
@@ -391,15 +397,36 @@ class SeLLaGatedRecLLM(Rec2Base):
         ``<ItemID>`` (``prepare_collm_prompt`` runs user and item embeddings
         through the same ``projection_model``).
 
-        Warm-starts from the MF checkpoint's ``trans_1``/``trans_2`` when the MF
-        was trained with the Step-2 semantic alignment — SeLLa's
-        ``pretrained_with_small=True``.
+        Two knobs, both about the SCALE of what lands in the prompt:
+
+        ``id_proj_warm_start`` (default True) copies the MF checkpoint's
+        ``trans_1``/``trans_2``. Note what those were trained for: the InfoNCE in
+        the MF's alignment pulls ``trans_2(GELU(trans_1(e_i)))`` toward
+        ``item_embedding_llm``, i.e. toward the LLM's **LAST-HIDDEN** space. Here
+        the output is injected as an **INPUT** embedding. In a 7B model those two
+        spaces differ in norm by an order of magnitude, so the warm start can put
+        a wildly out-of-scale vector into the prompt — and with LoRA frozen the
+        LLM cannot adapt to it. SeLLa's own shipped code uses
+        ``pretrained_with_small=False``, i.e. no warm start at all; the warm start
+        is a SigLLM addition.
+
+        ``id_proj_norm`` (default False) appends a LayerNorm scaled to
+        ``H ** -0.5``, exactly the treatment ``warm_proj`` already gets, which
+        pins the output norm near a real token embedding's regardless of what the
+        preceding layers produce. Turn it on if the "Soft-token scale vs real
+        token embeddings" log line shows a ratio far from 1.
         """
         H = int(self.llm_model.config.hidden_size)
         hidden = 1024
         trans_state = None
 
-        if pretrained_rec and pretrained_rec != "not_have" and os.path.exists(pretrained_rec):
+        if not self.id_proj_warm_start:
+            log_step(
+                "id_proj warm start DISABLED",
+                "id_proj_warm_start=False — fresh init, which is what SeLLa's "
+                "shipped code does (pretrained_with_small=False).",
+            )
+        elif pretrained_rec and pretrained_rec != "not_have" and os.path.exists(pretrained_rec):
             mf_state = torch.load(pretrained_rec, map_location="cpu")
             if "trans_1.weight" in mf_state and "trans_2.weight" in mf_state:
                 if int(mf_state["trans_2.weight"].shape[0]) == H:
@@ -412,13 +439,20 @@ class SeLLaGatedRecLLM(Rec2Base):
                         f"dims but LLM hidden is {H} — different base LLM?",
                     )
 
-        self.id_proj = nn.Sequential(
-            nn.Linear(d_cf, hidden), nn.GELU(), nn.Linear(hidden, H)
-        )
+        layers = [nn.Linear(d_cf, hidden), nn.GELU(), nn.Linear(hidden, H)]
+        if self.id_proj_norm:
+            layers.append(nn.LayerNorm(H))
+        self.id_proj = nn.Sequential(*layers)
         nn.init.normal_(self.id_proj[0].weight, std=0.02)
         nn.init.zeros_(self.id_proj[0].bias)
         nn.init.normal_(self.id_proj[2].weight, std=0.02)
         nn.init.zeros_(self.id_proj[2].bias)
+        if self.id_proj_norm:
+            # Same scaling warm_proj uses: LayerNorm output has unit variance per
+            # dim, so weight = H**-0.5 puts the vector's norm near 1 — the order
+            # of magnitude of a real Qwen2 input embedding.
+            nn.init.constant_(self.id_proj[3].weight, H ** -0.5)
+            nn.init.zeros_(self.id_proj[3].bias)
         self.id_proj = self.id_proj.to(self.device)
 
         if trans_state is not None:
@@ -435,7 +469,7 @@ class SeLLaGatedRecLLM(Rec2Base):
 
     def _init_history_qformer(
         self, d_cf, d_model, num_queries, num_heads, num_layers, dropout,
-        use_sem, use_user_slot, hist_target_fusion,
+        use_sem, use_user_slot, hist_target_fusion, delta_scale,
     ):
         if not self.use_qformer:
             self.history_qformer = None
@@ -465,6 +499,7 @@ class SeLLaGatedRecLLM(Rec2Base):
             use_sem=use_sem,
             use_user_slot=use_user_slot,
             hist_target_fusion=hist_target_fusion,
+            delta_scale=delta_scale,
         ).to(self.device)
 
         log_step("History Q-Former built", self.history_qformer.describe())
@@ -617,6 +652,22 @@ class SeLLaGatedRecLLM(Rec2Base):
                     "||g*delta||/||e_user||. Both flat at 0 means the module is "
                     "not earning its place.",
                 )
+                # delta_rel > 1 means the gated term is LARGER than the token it
+                # is added to: <UserID> is no longer being refined, it is being
+                # replaced by a vector the frozen LLM has never seen. This is not
+                # a tuning issue, it is the difference between an addition and an
+                # overwrite, and it costs uAUC immediately. It went unnoticed for
+                # a whole run (measured delta_rel = 12.2) because nothing shouted.
+                rel = stats.get("delta_rel")
+                if rel is not None and rel > 1.0:
+                    log_step(
+                        "!! GATED TERM IS OVERWRITING <UserID>",
+                        f"delta_rel={rel:.2f} — the added term is {rel:.1f}x the "
+                        "norm of id_proj(e_u). With delta_scale=match_ref this "
+                        "cannot exceed |gate|, so seeing it here means "
+                        "delta_scale='none' (the unnormalised out_proj output). "
+                        "Set model.sella_gated.delta_scale=match_ref.",
+                    )
 
         if self.mf_drift_log_steps > 0 and self._step_count % self.mf_drift_log_steps == 0:
             drift = self.mf_drift()
@@ -726,6 +777,55 @@ class SeLLaGatedRecLLM(Rec2Base):
             embeds["<Warm_ID>"] = self.warm_proj(warm_rows).unsqueeze(1)
         return embeds
 
+    @torch.no_grad()
+    def _log_soft_token_scale(self, embeds, order, inputs_embeds, text_mask):
+        """Compare each injected soft token's L2 norm against the REAL token
+        embeddings in the same batch, and complain if they are not comparable.
+
+        This is the failure that produced nothing but a worse number the first
+        time round, with no error anywhere. ``id_proj`` warm-starts from the MF's
+        ``trans_1``/``trans_2``, and those were trained to land in the LLM's
+        LAST-HIDDEN space (the distilled ``item_llm_emb`` bank is
+        ``space=last_hidden``) — but the output is injected at an INPUT-embedding
+        position. Those two spaces differ in scale by an order of magnitude or
+        more in a 7B model, and unlike ``warm_proj`` (Linear + LayerNorm)
+        ``id_proj`` has no normalisation to absorb it. A token that is 30x too
+        large is out of distribution for every position around it, and with LoRA
+        frozen the LLM cannot adapt to it.
+
+        A ratio near 1 means the token is in-distribution. Far from 1 means the
+        collaborative channel is being injected as noise, and the honest read of
+        a bad uAUC is "the injection is broken", not "collaborative signal does
+        not help".
+        """
+        text = inputs_embeds[text_mask].detach().float()
+        if text.numel() == 0:
+            return
+        text_norm = text.norm(dim=-1).mean().item()
+        parts = [f"text_tokens_mean_l2={text_norm:.3f}"]
+        worst_name, worst_ratio = None, 1.0
+        for ph in order:
+            emb = embeds[ph].detach().float()
+            n = emb.norm(dim=-1).mean().item()
+            ratio = n / text_norm if text_norm > 0 else float("inf")
+            parts.append(f"{ph}={n:.3f} (x{ratio:.2f})")
+            if abs(ratio - 1.0) > abs(worst_ratio - 1.0):
+                worst_name, worst_ratio = ph, ratio
+        log_step("Soft-token scale vs real token embeddings", ", ".join(parts))
+        if worst_name is not None and (worst_ratio > 5.0 or worst_ratio < 0.2):
+            log_step(
+                "!! SOFT-TOKEN SCALE MISMATCH",
+                f"{worst_name} is {worst_ratio:.1f}x the norm of a real token "
+                "embedding. The LLM sees an out-of-distribution vector at that "
+                "position and, with LoRA frozen, cannot adapt to it — expect uAUC "
+                "BELOW the text-only step-1 baseline. Most likely cause: id_proj "
+                "warm-started from MF trans_1/trans_2, which map into the LLM's "
+                "LAST-HIDDEN space, not its input-embedding space. Fix by "
+                "training with model.sella_gated.id_proj_norm=True (adds a "
+                "LayerNorm on id_proj's output, same treatment warm_proj already "
+                "gets), or drop the warm start.",
+            )
+
     def _build_prompt_inputs(self, prompt_template, batch_data):
         """Render the prompt, inject the three soft tokens, return
         ``(inputs_embeds, attention_mask, input_ids)``.
@@ -770,7 +870,8 @@ class SeLLaGatedRecLLM(Rec2Base):
 
         inputs_embeds = self.llm_model.get_input_embeddings()(tokens.input_ids)
 
-        slot_idx = torch.nonzero(tokens.input_ids == self._soft_token_id, as_tuple=False)
+        slots_mask = tokens.input_ids == self._soft_token_id
+        slot_idx = torch.nonzero(slots_mask, as_tuple=False)
         expected = batch_size * len(order)
         if slot_idx.shape[0] != expected:
             # Silence here would mean the soft tokens land in the wrong places
@@ -797,6 +898,7 @@ class SeLLaGatedRecLLM(Rec2Base):
                 f"prompt_tokens={int(tokens.input_ids.shape[1])}, "
                 f"valid_history[0]={int((batch_data['InteractedItemIDs_pad'][0] != self.rec_encoder.padding_index).sum().item()) if 'InteractedItemIDs_pad' in batch_data else 0}",
             )
+            self._log_soft_token_scale(embeds, order, inputs_embeds, ~slots_mask)
             self._has_logged_injection_stats = True
 
         if not self.has_print_prompt:
@@ -972,7 +1074,10 @@ class SeLLaGatedRecLLM(Rec2Base):
             qformer_use_sem=bool(sella.get("use_sem", True)),
             qformer_use_user_slot=bool(sella.get("use_user_slot", True)),
             qformer_hist_target_fusion=bool(sella.get("hist_target_fusion", False)),
+            qformer_delta_scale=str(sella.get("delta_scale", "match_ref")),
             ablate_qformer=bool(sella.get("ablate_qformer", False)),
+            id_proj_norm=bool(sella.get("id_proj_norm", False)),
+            id_proj_warm_start=bool(sella.get("id_proj_warm_start", True)),
             lm_loss_scope=str(sella.get("lm_loss_scope", "full")),
             gate_log_steps=int(sella.get("gate_log_steps", 50)),
             mf_drift_log_steps=int(cfg.get("mf_drift_log_steps", 200)),
