@@ -184,6 +184,8 @@ def apply_overrides(cfg, slug):
     cfg.run_cfg.min_lr = stage.min_lr
     cfg.run_cfg.max_epoch = stage.max_epoch
     cfg.run_cfg.rec_lr_scale = stage.rec_lr_scale
+    if "qformer_lr_scale" in stage:
+        cfg.run_cfg.qformer_lr_scale = stage.qformer_lr_scale
     cfg.run_cfg.rec_weight_decay = stage.rec_weight_decay
     if "batch_size_train" in stage:
         cfg.run_cfg.batch_size_train = stage.batch_size_train

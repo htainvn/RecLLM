@@ -227,6 +227,48 @@ model:
     # g = 0 remains an exact no-op in all three modes.
     delta_scale: match_ref
 
+    # PER-SAMPLE magnitude on top of match_ref. Added after observing
+    #   AUC +0.020 while uAUC +0.002 (0.719/0.6989 -> 0.739/0.701).
+    # That gap is the signature of a contribution with no per-CANDIDATE variation:
+    # match_ref alone fixes ||g*delta|| = |g|*||e_user|| IDENTICALLY for every
+    # sample, so only the direction varies. But "how strongly does this candidate
+    # match this user" is a statement about MAGNITUDE, and uAUC is precisely the
+    # metric per-candidate magnitude moves (a term constant within a user cancels
+    # in uAUC and shows up only in AUC).
+    #
+    #   mag = 1 + tanh(w . pooled),  w zero-init
+    # so at step 0 mag == 1 and this is bit-identical to constant magnitude;
+    # gradient still reaches w, so it grows only if it earns it. Bounded in (0,2),
+    # keeping the contribution <= 2*|g|*||e_user||.
+    per_sample_magnitude: True
+
+    # Where the gate STARTS. This is the one place the design departs from SeLLa
+    # structurally, and the departure cost a whole run.
+    #
+    # Checked in SeLLa's source: Proj^{W->L} (`Big_LinearProjection`) is a
+    # from-scratch nn.Linear(3584, 3584) — 12.85M params, PyTorch default init, no
+    # gate, no LayerNorm — and it is injected by ASSIGNMENT
+    # (`inputs_embeds[i, warm_pos] = warm_embeddings[i]`). So it contributes at
+    # FULL strength from step 0, and paper Tab. 5 shows it earns +0.0093 uAUC
+    # inside the ~110-update budget. NOTHING in SeLLa starts at zero contribution.
+    #
+    # A zero-init gate does, and that is structurally fatal on this budget: with
+    # Adam a scalar moves ~lr per step, so |gate| after 110 updates at lr 2e-4
+    # cannot exceed 0.022. Measured: gate = -0.0103 (47% of the ceiling),
+    # delta_rel = 0.0103, i.e. the term was ~1% of ||e_user|| (itself ~0.57 vs
+    # ~1.2 for a real Qwen2 embedding). The LLM never saw a perturbation big
+    # enough to matter, so uAUC could not move. On top of that, at gate == 0 the
+    # module's OWN gradient is exactly 0, so the body loses its first updates too.
+    #
+    #   0.0  strict "step 0 == no-Q-Former, bit for bit". Use it to VERIFY that
+    #        claim, and to reproduce the run above.
+    #   0.1  contribute 10% of the user token from step 0 (with
+    #        delta_scale=match_ref that is exactly what |gate| means) — bounded,
+    #        in-distribution, and structurally what SeLLa does. The gate is still
+    #        free to fall back toward 0, which stays the honest "no contribution"
+    #        verdict.
+    gate_init: 0.1
+
     # Semantic-slot source. Left null it falls back to
     # model.qformer_config.item_llm_emb_path. The preferred source is actually
     # neither file but the MF's live, TRAINED item_embedding_llm table (present
@@ -1142,6 +1184,24 @@ run:
     freeze_rec: false
     rec_lr_scale: 1.0
     rec_weight_decay: 1e-4
+
+    # LR multiplier for the gated Q-Former's own optimizer group.
+    #
+    # Why it is needed, measured: with Adam the per-step change in a scalar is
+    # ~lr, so |gate| after N updates cannot exceed ~N*lr. At SeLLa's budget
+    # (110 updates, lr 2e-4) the ceiling is 0.022 — and a real run finished at
+    # gate = -0.0103, i.e. 47% of the ceiling, contributing ~1% of ||e_user||
+    # (itself ~0.57 vs ~1.2 for a real Qwen2 embedding). The gate was never
+    # stuck: it moved as fast as the budget allowed and ran out of steps.
+    # SeLLa's 110 updates were sized for a WARM-STARTED projection, not a
+    # from-scratch 4.35M module behind a gate climbing from 0.
+    #
+    # 20 -> effective 4e-3 for the Q-Former, so |gate| can reach ~0.4 inside the
+    # same 110 updates while everything else stays at SeLLa's 2e-4. Set 1.0 to
+    # reproduce the run above. NOTE: adding this group changes the optimizer's
+    # group COUNT, so an optimizer state saved before this cannot be resumed
+    # (model weights are unaffected).
+    qformer_lr_scale: 20.0
 
 
     # MEMORY NOTE (batch_size_train / batch_size_eval are set in the budget block

@@ -145,6 +145,8 @@ class SeLLaGatedRecLLM(Rec2Base):
         qformer_use_user_slot=True,
         qformer_hist_target_fusion=False,
         qformer_delta_scale="match_ref",
+        qformer_per_sample_magnitude=True,
+        qformer_gate_init=0.0,
         ablate_qformer=False,
         id_proj_norm=False,
         id_proj_warm_start=True,
@@ -207,6 +209,8 @@ class SeLLaGatedRecLLM(Rec2Base):
             use_user_slot=qformer_use_user_slot,
             hist_target_fusion=qformer_hist_target_fusion,
             delta_scale=qformer_delta_scale,
+            per_sample_magnitude=qformer_per_sample_magnitude,
+            gate_init=qformer_gate_init,
         )
         self._init_prompts(prompt_path, prompt_template, max_txt_len, end_sym)
         self._apply_freeze_policy()
@@ -497,6 +501,7 @@ class SeLLaGatedRecLLM(Rec2Base):
     def _init_history_qformer(
         self, d_cf, d_model, num_queries, num_heads, num_layers, dropout,
         use_sem, use_user_slot, hist_target_fusion, delta_scale,
+        per_sample_magnitude, gate_init,
     ):
         if not self.use_qformer:
             self.history_qformer = None
@@ -527,6 +532,8 @@ class SeLLaGatedRecLLM(Rec2Base):
             use_user_slot=use_user_slot,
             hist_target_fusion=hist_target_fusion,
             delta_scale=delta_scale,
+            per_sample_magnitude=per_sample_magnitude,
+            gate_init=gate_init,
         ).to(self.device)
 
         log_step("History Q-Former built", self.history_qformer.describe())
@@ -1102,6 +1109,8 @@ class SeLLaGatedRecLLM(Rec2Base):
             qformer_use_user_slot=bool(sella.get("use_user_slot", True)),
             qformer_hist_target_fusion=bool(sella.get("hist_target_fusion", False)),
             qformer_delta_scale=str(sella.get("delta_scale", "match_ref")),
+            qformer_per_sample_magnitude=bool(sella.get("per_sample_magnitude", True)),
+            qformer_gate_init=float(sella.get("gate_init", 0.0)),
             ablate_qformer=bool(sella.get("ablate_qformer", False)),
             id_proj_norm=bool(sella.get("id_proj_norm", False)),
             id_proj_warm_start=bool(sella.get("id_proj_warm_start", True)),

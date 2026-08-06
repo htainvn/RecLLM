@@ -138,6 +138,8 @@ class GatedHistoryQFormer(nn.Module):
         use_user_slot: bool = True,
         hist_target_fusion: bool = False,
         delta_scale: str = "match_ref",
+        per_sample_magnitude: bool = True,
+        gate_init: float = 0.0,
     ):
         super().__init__()
         if delta_scale not in DELTA_SCALES:
@@ -203,6 +205,16 @@ class GatedHistoryQFormer(nn.Module):
             [_QFormerLayer(self.d_model, num_heads, dropout) for _ in range(num_layers)]
         )
         self.out_proj = nn.Linear(self.d_model, self.d_out)
+        # Zero-init magnitude head: see the `mag` block in forward. None when
+        # per_sample_magnitude is off, or when delta_scale='none' (there the raw
+        # out_proj output already carries its own, unbounded, magnitude).
+        self.per_sample_magnitude = bool(per_sample_magnitude) and delta_scale != "none"
+        if self.per_sample_magnitude:
+            self.mag_head = nn.Linear(self.d_model, 1)
+            nn.init.zeros_(self.mag_head.weight)
+            nn.init.zeros_(self.mag_head.bias)
+        else:
+            self.mag_head = None
 
         # --- the gate ---------------------------------------------------------
         # Scalar, zero-init. Step 0 is an exact no-op, so the LLM never sees an
@@ -215,7 +227,27 @@ class GatedHistoryQFormer(nn.Module):
         # 1-D on purpose: ``build_optimizer._is_non_decay`` files every tensor
         # with ndim < 2 into the no-weight-decay group, so the gate is not pulled
         # back toward 0 by decay.
-        self.gate = nn.Parameter(torch.zeros(1))
+        # gate_init != 0 exists because of a structural difference from SeLLa,
+        # confirmed in its source: SeLLa's Proj^{W->L} (`Big_LinearProjection`) is a
+        # from-scratch Linear(d_L, d_L) — 12.85M params, default init, NO gate —
+        # and it is injected by ASSIGNMENT (`inputs_embeds[i, pos] = ...`), so it
+        # contributes at full strength from step 0. Paper Tab. 5 shows it earns
+        # +0.0093 uAUC within SeLLa's ~110-update budget.
+        #
+        # Nothing in SeLLa starts at zero contribution. A zero-init gate does, and
+        # with Adam a scalar moves ~lr per step, so after 110 updates at lr 2e-4
+        # |gate| cannot exceed 0.022 — measured 0.0103, i.e. a contribution of ~1%
+        # of ||e_user||. The LLM never saw a perturbation large enough to matter.
+        # At gate == 0 the module's own gradient is also exactly 0 (see the test),
+        # so the body loses its first updates too.
+        #
+        # gate_init = 0.0 keeps the strict "step 0 is bit-identical" property and
+        # is the right setting to VERIFY that claim. gate_init ~ 0.1 with
+        # delta_scale=match_ref means "contribute 10% of the user token from step
+        # 0" — bounded, in-distribution, and structurally what SeLLa does. The gate
+        # is still free to move toward 0, which remains the honest "no
+        # contribution" verdict.
+        self.gate = nn.Parameter(torch.full((1,), float(gate_init)))
 
         # Diagnostics, kept as detached tensors so reading them costs no
         # host<->device sync inside the training step; ``.item()`` happens in the
@@ -241,6 +273,8 @@ class GatedHistoryQFormer(nn.Module):
             f"user_target_slot={'on' if self.fuse_user is not None else 'off'}",
             f"hist_target_fusion={'on' if self.hist_target_fusion else 'off'}",
             f"delta_scale={self.delta_scale}",
+            f"per_sample_magnitude={'on' if self.mag_head is not None else 'off'}",
+            f"gate_init={float(self.gate.detach().reshape(-1)[0]):.4g}",
             "text_branch=off",
             f"params={total / 1e6:.2f}M",
         ]
@@ -323,7 +357,8 @@ class GatedHistoryQFormer(nn.Module):
         for layer in self.layers:
             x = layer(x, memory, ~valid)
 
-        delta = self.out_proj(x.mean(dim=1))
+        pooled = x.mean(dim=1)
+        delta = self.out_proj(pooled)
 
         # --- scale control: the difference between a gated contribution and a
         # --- replacement of the token it is added to.
@@ -354,6 +389,23 @@ class GatedHistoryQFormer(nn.Module):
                 scale = reference.detach().to(delta.dtype).norm(dim=-1, keepdim=True)
             else:
                 scale = torch.ones(1, 1, dtype=delta.dtype, device=delta.device)
+            # PER-SAMPLE magnitude. Normalising the direction fixed the 255x
+            # overwrite, but it also made ||g*delta|| IDENTICAL for every sample —
+            # only the direction varied. For a personalisation term that is the
+            # wrong thing to freeze: "how strongly does this candidate match this
+            # user" is naturally a statement about MAGNITUDE, and uAUC is exactly
+            # the metric that per-candidate magnitude moves. (Observed: AUC
+            # +0.020 while uAUC +0.002 — a contribution with no per-candidate
+            # magnitude looks like a cross-user bias.)
+            #
+            # mag = 1 + tanh(w . pooled) with w ZERO-INIT, so at step 0 mag == 1
+            # exactly and this is bit-identical to the constant-magnitude version;
+            # gradient still reaches `mag_head` (d/dx tanh at 0 is 1), so it grows
+            # only if it earns it. Bounded in (0, 2), so the contribution stays
+            # <= 2*|g|*||e_user|| and `g` remains a meaningful upper bound.
+            if self.mag_head is not None:
+                mag = 1.0 + torch.tanh(self.mag_head(pooled))          # [B,1]
+                scale = scale * mag
             delta = direction * scale
         # "none" keeps the raw out_proj output — the original, broken behaviour,
         # retained only so the regression can be reproduced on demand.

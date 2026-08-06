@@ -7,6 +7,21 @@ import torch
 # the model is DDP-wrapped (``module.rec_encoder.*``).
 REC_ENCODER_MARKER = "rec_encoder."
 
+# The gated history Q-Former (sella_gated_rec_llm). Gets its own group for a
+# reason specific to a zero-init gate on a short budget: with Adam the per-step
+# change in a scalar parameter is ~lr, so after N updates |gate| cannot exceed
+# ~N * lr. At SeLLa's step-3 budget (110 updates, lr 2e-4) that ceiling is 0.022
+# — and a measured run ended at 0.0103, i.e. 47% of the ceiling. The gate was not
+# stuck; it was moving as fast as the budget allowed and ran out of steps. SeLLa's
+# 110 updates were sized for a WARM-STARTED projection, not a from-scratch module
+# behind a gate that has to climb from 0.
+#
+# run.qformer_lr_scale multiplies this group's LR (see the lr_scale handling in
+# sigllm.common.optims, since the schedulers overwrite every group's lr each
+# step). Empty for every other model, and empty groups are not appended, so
+# nothing changes for QRecLLM.
+QFORMER_MARKER = "history_qformer."
+
 
 def _is_non_decay(name, param):
     """Biases, norms and any 1-D tensor are excluded from weight decay."""
@@ -40,17 +55,22 @@ def build_optimizer(model, config):
     weight_decay = float(config.run_cfg.weight_decay)
     rec_weight_decay = float(config.run_cfg.get("rec_weight_decay", 1e-4))
     rec_lr_scale = float(config.run_cfg.get("rec_lr_scale", 1.0))
+    qformer_lr_scale = float(config.run_cfg.get("qformer_lr_scale", 1.0))
 
     p_wd, p_non_wd = [], []
     p_rec_wd, p_rec_non_wd = [], []
+    p_qf_wd, p_qf_non_wd = [], []
     num_parameters = 0
     num_rec_parameters = 0
+    num_qf_parameters = 0
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue  # frozen weights
-        is_rec = REC_ENCODER_MARKER in name
-        if is_rec:
+        if QFORMER_MARKER in name:
+            (p_qf_non_wd if _is_non_decay(name, param) else p_qf_wd).append(param)
+            num_qf_parameters += param.data.nelement()
+        elif REC_ENCODER_MARKER in name:
             (p_rec_non_wd if _is_non_decay(name, param) else p_rec_wd).append(param)
             num_rec_parameters += param.data.nelement()
         else:
@@ -76,8 +96,25 @@ def build_optimizer(model, config):
         optim_params.append(
             {"params": p_rec_non_wd, "weight_decay": 0.0, "lr_scale": rec_lr_scale}
         )
+    if p_qf_wd:
+        optim_params.append(
+            {"params": p_qf_wd, "weight_decay": weight_decay, "lr_scale": qformer_lr_scale}
+        )
+    if p_qf_non_wd:
+        # The gate lives here (ndim < 2 -> non-decay), which is the whole point.
+        optim_params.append(
+            {"params": p_qf_non_wd, "weight_decay": 0.0, "lr_scale": qformer_lr_scale}
+        )
 
     logging.info("number of trainable parameters: %d", num_parameters)
+    if num_qf_parameters:
+        logging.info(
+            "gated Q-Former is TRAINABLE: %d params in its own group "
+            "(lr_scale=%s -> effective lr %s). With a zero-init gate the reachable "
+            "|gate| after N Adam updates is ~N * effective_lr.",
+            num_qf_parameters, qformer_lr_scale,
+            float(config.run_cfg.init_lr) * qformer_lr_scale,
+        )
     if num_rec_parameters:
         logging.info(
             "rec encoder is TRAINABLE: %d params in its own group "
