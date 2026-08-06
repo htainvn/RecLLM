@@ -978,12 +978,54 @@ class SeLLaGatedRecLLM(Rec2Base):
             mf_drift_log_steps=int(cfg.get("mf_drift_log_steps", 200)),
         )
 
+        # --- LoRA source, loaded BEFORE the main checkpoint ------------------
+        # The runner strips every requires_grad=False tensor when saving, and on
+        # this branch LoRA is frozen (lora_trainable=False, SeLLa parity). So a
+        # checkpoint produced by THIS stage carries no lora_* keys at all: it
+        # holds the collaborative modules and nothing else. Loading it alone
+        # leaves LoRA at its init, where lora_B is zeros — i.e. LoRA is the
+        # identity and the "adapted" LLM is silently the raw base model.
+        #
+        # `lora_ckpt` names the checkpoint that DOES carry LoRA (normally the
+        # step-1 one). It is loaded first so the main checkpoint can still
+        # overwrite anything it legitimately owns.
+        lora_loaded = 0
+        lora_source = None
+        lora_ckpt_path = cfg.get("lora_ckpt", None)
+        if lora_ckpt_path and os.path.exists(lora_ckpt_path):
+            blob = torch.load(lora_ckpt_path, map_location="cpu")
+            state = blob.get("model", blob) if isinstance(blob, dict) else blob
+            lora_state = {k: v for k, v in state.items()
+                          if isinstance(k, str) and "lora_" in k}
+            if lora_state:
+                model.load_state_dict(lora_state, strict=False)
+                lora_loaded = len(lora_state)
+                lora_source = lora_ckpt_path
+                log_step(
+                    "LoRA restored from",
+                    f"{lora_ckpt_path} ({lora_loaded} lora_* tensors)",
+                )
+            else:
+                log_step(
+                    "LoRA source carries NO lora_* keys",
+                    f"{lora_ckpt_path} — check that it is a step-1 checkpoint.",
+                )
+        elif lora_ckpt_path:
+            log_step("LoRA source not found", str(lora_ckpt_path))
+
         ckpt_path = cfg.get("ckpt", "")
         if ckpt_path:
             log_step("Loading checkpoint", ckpt_path)
             ckpt = torch.load(ckpt_path, map_location="cpu")
             msg = model.load_state_dict(ckpt["model"], strict=False)
             log_step("load_state_dict", str(msg))
+            main_lora = sum(
+                1 for k in ckpt["model"] if isinstance(k, str) and "lora_" in k
+            )
+            if main_lora:
+                lora_loaded += main_lora
+                lora_source = ckpt_path
+                log_step("LoRA restored from", f"{ckpt_path} ({main_lora} lora_* tensors)")
 
             # Restore the pretrained MF ONLY when the checkpoint does not carry
             # its own: the runner strips frozen tensors when saving, so a step-1
@@ -1018,6 +1060,39 @@ class SeLLaGatedRecLLM(Rec2Base):
                     else " — FRESH Q-Former, gate starts at 0 (expected when "
                     "warm-starting from a step-1 LoRA checkpoint)."
                 ),
+            )
+
+        # --- the guard that makes the failure impossible to miss -------------
+        # A frozen, never-loaded LoRA is the one failure mode of this branch
+        # that costs nothing at build time, raises no error, and simply reports
+        # worse numbers — the base model wearing an identity adapter. It has to
+        # be an exception, not a warning. `allow_cold_lora` is the explicit
+        # opt-in (ckpt_from: none sets it).
+        if model.use_lora and not model.lora_trainable and lora_loaded == 0:
+            if bool(cfg.get("allow_cold_lora", False)):
+                log_step(
+                    "COLD LoRA (explicitly allowed)",
+                    "LoRA is frozen at its zero-init, i.e. the identity — the LLM "
+                    "is the unadapted base model. Only meaningful as a deliberate "
+                    "ablation.",
+                )
+            else:
+                raise RuntimeError(
+                    "LoRA is frozen (lora_trainable=False) but NO lora_* tensors "
+                    "were loaded, so lora_B is still zeros and the adapter is the "
+                    "identity — this would evaluate the unadapted base model and "
+                    "silently report worse numbers.\n"
+                    f"  model.ckpt      = {ckpt_path or None}\n"
+                    f"  model.lora_ckpt = {lora_ckpt_path or None}\n"
+                    "Fix: point run.sella_gated_step3.lora_from at the stage whose "
+                    "checkpoint carries LoRA (default 'sella_step1'), or set "
+                    "run.sella_gated_step3.ckpt_from=none to opt into a cold LoRA."
+                )
+        elif model.use_lora and not model.lora_trainable:
+            log_step(
+                "LoRA check OK",
+                f"{lora_loaded} lora_* tensors loaded from {lora_source}; frozen "
+                "for training (SeLLa parity).",
             )
 
         model.set_answer_type(mode=cfg.get("ans_type", "v2"))

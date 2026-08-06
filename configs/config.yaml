@@ -270,25 +270,38 @@ datasets:
     # exactly the sequence length Stage 3 feeds it. Changing this requires
     # rebuilding the qformer pkls.
     #
-    # 40, down from 50 (and originally 10). Measured on the raw ml-1m split
+    # 10 — which is SeLLa's OWN cap, not just a cheap setting. SeLLa
+    # `codes/step3_train_sella/prepare_finetune_data.py` uses max_len=10 for the
+    # title list and pads/truncates `his` to max_length=10. So on the
+    # SeLLa-gated branch (arch: sella_gated_rec_llm) this value is part of the
+    # parity claim, and raising it is a deliberate departure from SeLLa rather
+    # than a free improvement.
+    #
+    # Measured on the raw ml-1m split after the min_positive_history=2 filter
     # (real items, padding excluded): median real history is 24 on train, 38 on
-    # valid, 42 on test, with p90 = 97 / 138 / 192.
+    # valid, 42 on test; p90 = 97 / 138 / 192; mean 39 / 58 / 76.
     #
-    # Coverage (fraction of rows whose FULL history fits) vs cost:
-    #     cap  train  valid   test | tok max  slack | ui fwd  act MB
-    #      10  28.1%  16.0%  13.1% |      86    938 |   1.0x      32
-    #  ->  40  66.1%  52.3%  48.6% |     280    744 |   4.0x     129
-    #      50  72.6%  59.5%  57.1% |     332    692 |   5.0x     161
-    #      80  85.7%  76.1%  69.5% |     495    529 |   8.0x     258
-    #     100  90.7%  82.8%  74.2% |     618    406 |  10.0x     323
+    # Coverage (fraction of rows whose FULL history fits) and mean items kept.
+    # The 10/40/50/80/100 coverage rows were re-measured and reproduce the
+    # original table exactly; 20 and 30 were added by the same script.
+    #     cap  train  valid   test | mean kept tr/va/te | tok max  slack
+    #  -> 10   28.1%  16.0%  13.1% |   8.6   9.3    9.5 |      86    938
+    #     20   45.3%  30.9%  25.7% |  15.0  17.0   17.6 |    ~197    ~830
+    #     30   57.0%  43.1%  38.1% |  19.9  23.3   24.5 |    ~274    ~750
+    #     40   66.1%  52.3%  48.6% |  23.7  28.6   30.2 |     280    744
+    #     50   72.6%  59.5%  57.1% |  26.8  33.0   34.9 |     332    692
+    #     80   85.7%  76.1%  69.5% |  32.9  42.6   45.6 |     495    529
+    #    100   90.7%  82.8%  74.2% |  35.3  46.7   51.2 |     618    406
     #
-    # 50 -> 40 costs ~7-9 points of full-history coverage and buys back ~52
-    # prompt tokens per sample plus a fifth of the history-side compute. On the
-    # SeLLa-gated branch (arch: sella_gated_rec_llm) the token saving is worth
-    # more than it looks: that branch trains with FULL-VOCABULARY LM
-    # cross-entropy over the whole sequence, so its dominant memory term scales
-    # with prompt length x 151936, not with the history tensor. ~280 vs ~332
-    # tokens is roughly a 15% cut in that term.
+    # Read the low coverage honestly: at 10, 72% of train rows and 87% of test
+    # rows are truncated, so a flat uAUC does NOT show "history does not help" —
+    # it shows "the most recent 10 items do not help". Testing that properly
+    # means raising the cap, which on the gated branch also costs memory (below).
+    #
+    # Cost on the gated branch is dominated by the PROMPT, not the history
+    # tensor: that branch trains with FULL-VOCABULARY LM cross-entropy over the
+    # whole sequence, so its largest term scales with prompt length x 151936.
+    # ~86 tokens at cap 10 vs ~332 at cap 50 is nearly a 4x difference in it.
     #
     # Prompt budget is NOT the binding constraint at any of these: on the gated
     # branch the collaborative signal is 3 soft tokens regardless of history
@@ -997,6 +1010,22 @@ run:
     #   none         cold LoRA — an explicitly different experiment.
     ckpt_from: sella_step1
 
+    # Where LoRA comes from when ckpt_from=self.
+    #
+    # This stage FREEZES LoRA, and RunnerBase._save_checkpoint drops every
+    # requires_grad=False tensor — so a checkpoint written by this stage contains
+    # the collaborative modules and NO lora_* keys. Resuming / eval-only /
+    # ablate-at-inference (all ckpt_from=self) would therefore leave lora_B at
+    # its zero-init, making the adapter the identity and quietly scoring the
+    # unadapted base LLM. Same set of values as ckpt_from; only read when
+    # ckpt_from=self.
+    #
+    # The model RAISES if LoRA is frozen and nothing supplied it, unless
+    # ckpt_from=none (which sets allow_cold_lora). A cold frozen LoRA is the one
+    # failure here that costs nothing at build time and only shows up as worse
+    # numbers, so it is an error, not a warning.
+    lora_from: sella_step1
+
     # MF joins the trainable set, as SeLLa does at its final step, in its own
     # optimizer param group. rec_lr_scale 3.33 * init_lr 3e-5 ~= 1e-4 for the
     # embeddings — same setting as qformer_stage3_step2, which is where the
@@ -1018,10 +1047,12 @@ run:
     # sequence, where QRecLLM's touched ONE position. With Qwen2's 151936-token
     # vocab, the fp32 logits for the supervised positions cost ~0.6 MB per
     # PROMPT TOKEN per sample, plus as much again inside cross_entropy. At
-    # datasets.movie_ood.max_history_length=40 the prompt runs ~280-300 tokens,
-    # so ~0.35-0.4 GB/sample transient — ~6 GB at batch 16 on top of the 14 GB
-    # fp16 model. 8 keeps it near 3 GB. Raising the history cap raises this
-    # LINEARLY, so change the two together.
+    # datasets.movie_ood.max_history_length=10 (SeLLa's cap) the prompt runs
+    # ~86-120 tokens, so only ~0.1-0.15 GB/sample transient — batch 8 costs
+    # ~1 GB, and batch 16-32 is comfortable if you want the throughput (halve
+    # iters_per_epoch to keep samples/epoch comparable).
+    # This term scales LINEARLY in prompt length, so if you raise the history
+    # cap, re-check it: at cap 50 the same batch costs ~4x more.
     #
     # If it still OOMs, in order of preference:
     #   1. model.sella_gated.lm_loss_scope=answer  (supervises 1 position per

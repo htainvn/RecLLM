@@ -93,28 +93,41 @@ def resolve_warm_start(cfg, slug):
     """
     stage_cfg = cfg.run_cfg.sella_gated_step3
     source = str(stage_cfg.get("ckpt_from", "sella_step1")).lower()
+    return checkpoint_for(cfg, source, slug), source
+
+
+CKPT_SOURCES = {
+    "sella_step1": "sella_gated_step1",
+    "step1": "qformer_stage3_step1",
+    "step2": "qformer_stage3_step2",
+}
+
+
+def checkpoint_for(cfg, source, slug):
+    """``<output_dir>/<slug>/<best_ckpt_name>`` for one named source, or None.
+
+    Kept separate from ``resolve_warm_start`` so the LoRA source can be resolved
+    independently of ``ckpt_from`` — the two differ exactly when ``ckpt_from`` is
+    ``self``.
+    """
+    source = str(source).lower()
     if source == "none":
-        return None, source
-    sources = {
-        "sella_step1": "sella_gated_step1",
-        "step1": "qformer_stage3_step1",
-        "step2": "qformer_stage3_step2",
-    }
+        return None
     if source == "self":
-        stage = stage_cfg
-    elif source in sources:
-        stage = cfg.run_cfg.get(sources[source])
+        stage = cfg.run_cfg.sella_gated_step3
+    elif source in CKPT_SOURCES:
+        stage = cfg.run_cfg.get(CKPT_SOURCES[source])
         if stage is None:
             raise ValueError(
-                f"ckpt_from={source!r} needs run.{sources[source]} in the config"
+                f"source={source!r} needs run.{CKPT_SOURCES[source]} in the config"
             )
     else:
         raise ValueError(
-            "run.sella_gated_step3.ckpt_from must be one of 'sella_step1', "
-            f"'step1', 'step2', 'self', 'none' — got {source!r}"
+            "checkpoint source must be one of 'sella_step1', 'step1', 'step2', "
+            f"'self', 'none' — got {source!r}"
         )
     best_name = stage.get("best_ckpt_name", "checkpoint_best.pth")
-    return os.path.join(stage.output_dir, slug, best_name), source
+    return os.path.join(stage.output_dir, slug, best_name)
 
 
 def apply_overrides(cfg, slug):
@@ -135,6 +148,32 @@ def apply_overrides(cfg, slug):
 
     ckpt_path, source = resolve_warm_start(cfg, slug)
     cfg.model_cfg.ckpt = ckpt_path
+
+    # LoRA source. This stage FREEZES LoRA, and the runner strips frozen tensors
+    # when saving — so a checkpoint written by this stage carries no lora_* keys.
+    # When `ckpt` is such a checkpoint (ckpt_from: self, i.e. resume / eval-only /
+    # ablate-at-inference), LoRA has to come from somewhere else or the adapter
+    # stays at its zero-init identity and the run silently scores the unadapted
+    # base model. `lora_from` names that somewhere; the model raises if nothing
+    # supplies LoRA and `allow_cold_lora` is not set.
+    lora_ckpt = None
+    if source == "self":
+        lora_source = str(stage.get("lora_from", "sella_step1")).lower()
+        lora_ckpt = checkpoint_for(cfg, lora_source, slug)
+        LOGGER.info(
+            "ckpt_from=self -> LoRA cannot come from `ckpt` (this stage freezes "
+            "LoRA, so its own checkpoints carry no lora_* keys). Taking LoRA from "
+            "%s: %s",
+            lora_source, lora_ckpt,
+        )
+        if lora_ckpt and not os.path.exists(lora_ckpt):
+            LOGGER.warning(
+                "LoRA source %s does not exist — the model will REFUSE to build "
+                "rather than silently score an unadapted base LLM.", lora_ckpt,
+            )
+    cfg.model_cfg.lora_ckpt = lora_ckpt
+    # ckpt_from=none is the ONLY explicit opt-in to an unadapted base LLM.
+    cfg.model_cfg.allow_cold_lora = source == "none"
 
     # --- run --------------------------------------------------------------
     cfg.run_cfg.output_dir = stage.output_dir
