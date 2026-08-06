@@ -1,0 +1,25 @@
+A user has given high ratings to the following movies. Given the movie list and a target movie's title. Please identify whether the user would like the target movie by answering "Yes" or "No". MovieList: <ItemTitleList>. Target Movie: <TargetItemTitle>.
+# Stage-1 (LoRA / TALLRec) prompt, transcribed from the SeLLa-Rec paper Fig. 2.
+#
+# Why this file exists instead of qformer_prompt_movie_text_only.txt: the paper's
+# Fig. 2 (LoRA training) and Fig. 4 (projection training, i.e. our step 3) share
+# their wording almost verbatim — same opening sentence, same "MovieList: ... /
+# Target Movie: ..." tail, same 'Yes.'/'No.' instruction. Fig. 4 only INSERTS the
+# three soft-token clauses. That matters because step 3 FREEZES LoRA: whatever
+# instruction LoRA was adapted to is the instruction it is good at. Training
+# stage 1 on RecLLM's own text-only wording (3 sampled variants, different verbs)
+# and then switching to SeLLa's wording at step 3 makes the frozen adapter work
+# out of distribution for no benefit.
+#
+# ONE line, matching TALLRec / SeLLa (no prompt sampling).
+#
+# Reference point for this stage, paper Tab. 3 (Movie, TEST split):
+#     TALLREC   AUC 0.7268   UAUC 0.6989
+# That is exactly what this stage is, so it is the number to expect here — and
+# the number step 3 must BEAT. Step 3 landing on 0.6989 means the collaborative
+# channel contributed nothing.
+#
+# NOTE the placeholder names are SigLLM's (<ItemTitleList>, <TargetItemTitle>);
+# the paper writes <Movie_List> / <Target_Movie>. Same content.
+# Must contain NO soft-token placeholder — train_sella_gated_step1_lora.py
+# hard-errors otherwise, because at stage 1 the Q-Former is random AND frozen.

@@ -260,13 +260,22 @@ model:
     #   code does (pretrained_with_small=False); the warm start is a SigLLM
     #   addition. Turning it off also removes the last-hidden-space mismatch.
     id_proj_norm: False
-    # SeLLa calls prepare_collm_prompt(..., pretrained_with_small=False) with
-    # projection_model_path=None — it NEVER warm-starts the projection from the
-    # MF's trans_1/trans_2. The warm start is a SigLLM addition, and it feeds
-    # weights the MF's InfoNCE trained toward LAST-HIDDEN space into an INPUT
-    # embedding slot. Worse, that InfoNCE L2-normalises both sides, so it never
-    # constrained trans_2's output MAGNITUDE at all. False = SeLLa.
-    id_proj_warm_start: False
+    # TRUE, per the PAPER — corrected after reading it. The uploaded code calls
+    # prepare_collm_prompt(..., pretrained_with_small=False), and reading only the
+    # code I set this to False and called it "SeLLa parity". That was wrong: the
+    # paper makes the warm start one of its two headline contributions (§2, §4.3 —
+    # "we initialize the projection layer ... using parameters from the trained
+    # projection layer during the above collaborative model contrastive learning,
+    # rather than employing random initialization"), and it MEASURES the
+    # alternative as an ablation:
+    #     SeLLa-Rec  (warm-started proj)  AUC 0.7606  UAUC 0.7464
+    #     SeLLa-Proj (random-init proj)   AUC 0.7511  UAUC 0.7333   <- Tab. 5
+    # i.e. the shipped `pretrained_with_small=False` reproduces the ABLATION, at a
+    # cost of -0.0095 AUC / -0.0131 UAUC. Paper Tab. 6 says the same at step 0
+    # (Movie-Warm AUC: CL+Projection 0.7421 vs CL-only 0.7393).
+    #
+    # Set False only to reproduce SeLLa-Proj deliberately.
+    id_proj_warm_start: True
     # SeLLa's LinearProjection never re-initialises — it keeps PyTorch's default
     # Linear init. SigLLM used std=0.02 on both layers, which shrinks the output:
     #   measured ||id_proj(e_u)|| = 0.27 vs ~1.2 for a real Qwen2 embedding.
@@ -1039,7 +1048,11 @@ run:
     # errors if the prompt is not text-only.
     #
     # Separate output_dir so nhánh A's step 1 (if it is also run) is untouched.
-    prompt_path: "/content/SigLLM/prompts/qformer_prompt_movie_text_only.txt"
+    # Paper Fig. 2, whose wording matches Fig. 4 (step 3) almost verbatim. Step 3
+    # FREEZES LoRA, so the instruction LoRA was adapted to must be the one step 3
+    # uses; RecLLM's text_only prompt is worded differently and samples 3 variants.
+    # Expected result for this stage = paper Tab. 3 TALLREC: AUC 0.7268 / UAUC 0.6989.
+    prompt_path: "/content/SigLLM/prompts/sella_gated_step1_movie.txt"
     output_dir: "/content/SigLLM/ckpt/sella_gated_step1_lora_qwen2/"
     best_ckpt_name: "checkpoint_best.pth"
     init_lr: 8e-5
